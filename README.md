@@ -568,7 +568,7 @@ https://my-bucket.oss-cn-hangzhou.aliyuncs.com/aichat
 
 **列表方式**：S3 ListObjects V2（`GET {桶根}/?list-type=2&prefix={BASE路径}/&max-keys=1000`）。当前未做分页，单次最多 1000 个对象。
 
-**权限要求**：桶需允许匿名 `ListObjects`（GET Bucket）与 `GetObject`（GET Object）。只开 Get 不开 List 时无法枚举 zip，App 会提示 HTTP 403。
+**权限要求**：默认桶需允许匿名 `ListObjects`（GET Bucket）与 `GetObject`（GET Object）。也可在添加 COS 仓库时开启「使用访问密钥（私有读）」，用 AccessKey 做请求签名（支持腾讯云 COS、阿里云 OSS），此时桶可保持私有读。密钥仅保存在本机。只开 Get 不开 List 且未配置密钥时无法枚举 zip，App 会提示 HTTP 403。
 
 ---
 

@@ -11,6 +11,7 @@ import '../providers/character_provider.dart';
 import '../providers/sticker_provider.dart';
 import '../providers/workshop_provider.dart';
 import '../services/character_pack_service.dart';
+import '../services/cos_auth.dart';
 import '../services/sticker_pack_service.dart';
 import '../services/workshop_service.dart';
 import '../utils/conversation_relink.dart';
@@ -305,6 +306,7 @@ class _WorkshopScreenState extends State<WorkshopScreen> {
         builder: (_) => _BatchDownloadDialog(
           items: selected,
           getProxyUrl: (item) => workshop.proxyById(item.repoId) ?? '',
+          getCosAuth: (item) => workshop.cosAuthById(item.repoId),
         ),
       );
       if (!mounted) return;
@@ -1041,10 +1043,12 @@ class _DownloadZipDialogState extends State<_DownloadZipDialog> {
 class _BatchDownloadDialog extends StatefulWidget {
   final List<_ZipItem> items;
   final String Function(_ZipItem item) getProxyUrl;
+  final CosAuth? Function(_ZipItem item)? getCosAuth;
 
   const _BatchDownloadDialog({
     required this.items,
     required this.getProxyUrl,
+    this.getCosAuth,
   });
 
   @override
@@ -1073,9 +1077,11 @@ class _BatchDownloadDialogState extends State<_BatchDownloadDialog> {
 
       final item = widget.items[i];
       final proxyUrl = widget.getProxyUrl(item);
+      final auth = widget.getCosAuth?.call(item);
       final path = await WorkshopService.downloadZip(
         downloadUrl: item.asset.downloadUrl,
         proxyUrl: proxyUrl,
+        auth: auth,
         onProgress: (p) {
           if (mounted) setState(() => _currentProgress = p);
         },

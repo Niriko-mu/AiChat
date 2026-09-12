@@ -517,7 +517,7 @@ When using COS / OSS / S3-compatible object storage, the app auto-discovers asse
 
 **Listing**: S3 ListObjects V2 (`GET {bucket-root}/?list-type=2&prefix={base-path}/&max-keys=1000`). Pagination is not implemented yet; up to 1000 objects per request.
 
-**Permissions**: the bucket must allow anonymous **ListObjects** (GET Bucket) and **GetObject** (GET Object). If only GetObject is allowed, the app cannot enumerate zips and will show HTTP 403.
+**Permissions**: by default the bucket must allow anonymous **ListObjects** (GET Bucket) and **GetObject** (GET Object). Alternatively, enable "Use access keys (private read)" when adding a COS repository to sign requests with AccessKey (Tencent COS / Aliyun OSS supported); the bucket can stay private. Keys are stored only on device. Without list permission and without keys, the app cannot enumerate zips and shows HTTP 403.
 
 ---
 

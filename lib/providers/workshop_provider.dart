@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 import '../models/workshop_asset.dart';
 import '../models/workshop_repository.dart';
+import '../services/cos_auth.dart';
 import '../services/workshop_service.dart';
 
 /// 创意工坊：管理可用的角色卡仓库（本地持久化），并拉取各仓库的资产 zip。
@@ -105,6 +106,7 @@ class WorkshopProvider extends ChangeNotifier {
     required String path,
     String proxyUrl = '',
     String? type,
+    CosAuth cosAuth = const CosAuth(),
   }) async {
     final repoType = _resolveRepoType(path, type);
 
@@ -114,7 +116,15 @@ class WorkshopProvider extends ChangeNotifier {
           'COS 来源需填写完整 http(s) BASE_URL（且不能为 GitHub / Gitee）',
         );
       }
-      final tags = await WorkshopService.checkCosFolders(path);
+      if (cosAuth.enabled &&
+          (cosAuth.accessKeyId.trim().isEmpty ||
+              cosAuth.secretAccessKey.trim().isEmpty)) {
+        throw const FormatException('启用访问密钥时，请填写 AccessKey ID 与 Secret');
+      }
+      final tags = await WorkshopService.checkCosFolders(
+        path,
+        auth: cosAuth.isConfigured ? cosAuth : null,
+      );
       final repo = WorkshopRepository(
         id: const Uuid().v4(),
         name: WorkshopService.cosDisplayName(path),
@@ -122,6 +132,7 @@ class WorkshopProvider extends ChangeNotifier {
         proxyUrl: '',
         type: WorkshopRepoType.cos,
         availableTags: tags,
+        cosAuth: cosAuth.isConfigured ? cosAuth : const CosAuth(),
         error: tags.isEmpty
             ? '未检测到 Characters / Games / Stickers / Note 目录'
             : null,
@@ -175,7 +186,10 @@ class WorkshopProvider extends ChangeNotifier {
     if (index == -1) return;
     try {
       if (repo.isCos) {
-        final tags = await WorkshopService.checkCosFolders(repo.url);
+        final tags = await WorkshopService.checkCosFolders(
+          repo.url,
+          auth: repo.hasCosAuth ? repo.cosAuth : null,
+        );
         _repositories[index] = repo.copyWith(
           availableTags: tags,
           error: tags.isEmpty ? _cosEmptyTagError : null,
@@ -205,6 +219,7 @@ class WorkshopProvider extends ChangeNotifier {
     required String path,
     String proxyUrl = '',
     String? type,
+    CosAuth? cosAuth,
   }) async {
     final repoType = _resolveRepoType(path, type ?? repo.type.name);
     late final WorkshopRepository updated;
@@ -215,7 +230,16 @@ class WorkshopProvider extends ChangeNotifier {
           'COS 来源需填写完整 http(s) BASE_URL（且不能为 GitHub / Gitee）',
         );
       }
-      final tags = await WorkshopService.checkCosFolders(path);
+      final auth = cosAuth ?? repo.cosAuth;
+      if (auth.enabled &&
+          (auth.accessKeyId.trim().isEmpty ||
+              auth.secretAccessKey.trim().isEmpty)) {
+        throw const FormatException('启用访问密钥时，请填写 AccessKey ID 与 Secret');
+      }
+      final tags = await WorkshopService.checkCosFolders(
+        path,
+        auth: auth.isConfigured ? auth : null,
+      );
       updated = WorkshopRepository(
         id: repo.id,
         name: WorkshopService.cosDisplayName(path),
@@ -223,6 +247,7 @@ class WorkshopProvider extends ChangeNotifier {
         proxyUrl: '',
         type: WorkshopRepoType.cos,
         availableTags: tags,
+        cosAuth: auth.isConfigured ? auth : const CosAuth(),
         error: tags.isEmpty ? _cosEmptyTagError : null,
       );
     } else {
@@ -267,7 +292,11 @@ class WorkshopProvider extends ChangeNotifier {
     if (cached != null) return cached;
     final List<WorkshopAsset> list;
     if (repo.isCos) {
-      list = await WorkshopService.listCosAssets(repo.url, tag);
+      list = await WorkshopService.listCosAssets(
+        repo.url,
+        tag,
+        auth: repo.hasCosAuth ? repo.cosAuth : null,
+      );
     } else {
       final parsed = WorkshopService.parseRepoPath(repo.url);
       list = parsed == null
@@ -289,6 +318,14 @@ class WorkshopProvider extends ChangeNotifier {
   String? proxyById(String id) {
     for (final r in _repositories) {
       if (r.id == id) return proxyFor(r);
+    }
+    return null;
+  }
+
+  /// 按仓库 id 查询 COS 私有读鉴权（未配置返回 null）
+  CosAuth? cosAuthById(String id) {
+    for (final r in _repositories) {
+      if (r.id == id && r.hasCosAuth) return r.cosAuth;
     }
     return null;
   }
@@ -332,7 +369,10 @@ class WorkshopProvider extends ChangeNotifier {
       // Git：读 V1.2.0 Release body；COS：读 Note/*.md 全文
       final String? body;
       if (notifyRepo.isCos) {
-        body = await WorkshopService.fetchCosNote(notifyRepo.url);
+        body = await WorkshopService.fetchCosNote(
+          notifyRepo.url,
+          auth: notifyRepo.hasCosAuth ? notifyRepo.cosAuth : null,
+        );
       } else {
         body = await WorkshopService.fetchReleaseBody(
           notifyRepo.url,

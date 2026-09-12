@@ -5,6 +5,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:xml/xml.dart';
 import '../models/workshop_asset.dart';
 import '../models/workshop_repository.dart';
+import 'cos_auth.dart';
 
 /// 创意工坊仓库服务：检查仓库 Release tag 可用性、拉取资产 zip、下载 zip。
 ///
@@ -14,8 +15,9 @@ import '../models/workshop_repository.dart';
 /// 支持 GitHub 与 Gitee 仓库；检测与资产拉取直连官方 API，
 /// 代理仅用于 zip 下载加速（仅对 GitHub 生效，Gitee 始终直连）。
 ///
-/// 另支持 COS 类对象储存（腾讯云 COS / 阿里云 OSS / AWS S3 / MinIO 等）：
-/// 用户填写 BASE_URL，App 按固定目录约定自动发现资产（需匿名 ListObjects + GetObject）。
+/// 另支持 COS 类对象储存（腾讯云 COS / 阿里云 OSS 等）：
+/// 用户填写 BASE_URL，App 按固定目录约定自动发现资产。
+/// 默认匿名 ListObjects + GetObject；可选访问密钥做私有读鉴权。
 class WorkshopService {
   /// COS 目录约定：角色分类
   static const String kCosCharactersFolder = 'Characters';
@@ -77,10 +79,47 @@ class WorkshopService {
     return looksLikeCosUrl(p) ? WorkshopRepoType.cos : WorkshopRepoType.git;
   }
 
+  static Map<String, String> _cosHeaders(Uri uri, CosAuth? auth) {
+    if (auth == null || !auth.isConfigured) return const {};
+    return buildCosAuthHeaders(
+      method: 'GET',
+      uri: uri,
+      accessKeyId: auth.accessKeyId,
+      secretAccessKey: auth.secretAccessKey,
+    );
+  }
+
+  static void _throwCosStatus(int status, String body, {CosAuth? auth}) {
+    if (status == 403) {
+      final usingAuth = auth?.isConfigured ?? false;
+      final code = _cosErrorCode(body);
+      throw HttpException(
+        usingAuth
+            ? '对象储存鉴权失败（HTTP 403${code.isEmpty ? '' : ' / $code'}）。'
+                '请检查 SecretId/SecretKey 是否配对、密钥是否有效，'
+                '以及子账号是否有 ListBucket / GetObject 权限。'
+            : '对象储存拒绝匿名访问（HTTP 403${code.isEmpty ? '' : ' / $code'}）。'
+                '可开启公有读，或在添加仓库时启用访问密钥做私有读。',
+      );
+    }
+    throw HttpException('对象储存请求失败（HTTP $status）');
+  }
+
+  static String _cosErrorCode(String body) {
+    try {
+      final doc = XmlDocument.parse(body);
+      for (final e in doc.descendantElements) {
+        if (e.name.local == 'Code') return e.innerText.trim();
+      }
+    } catch (_) {}
+    return '';
+  }
+
   /// S3 ListObjects V2：GET {桶根}/?list-type=2&prefix={BASE路径}/&max-keys=1000
   static Future<List<({String key, int size})>> listCosObjects(
-    String baseUrl,
-  ) async {
+    String baseUrl, {
+    CosAuth? auth,
+  }) async {
     final parsed = parseCosBaseUrl(baseUrl);
     final prefix = parsed.prefix.isEmpty ? '' : '${parsed.prefix}/';
     // 空 prefix 不可写入 queryParameters：Dart 会拼成 `prefix`（无 =），COS 返回 400
@@ -92,16 +131,11 @@ class WorkshopService {
         'max-keys': '1000',
       },
     );
-    final resp =
-        await http.get(listUri).timeout(const Duration(seconds: 20));
-    if (resp.statusCode == 403) {
-      throw const HttpException(
-        '对象储存拒绝匿名列表（HTTP 403）。请在控制台为该桶开启公有读，'
-        '或配置 Bucket Policy 允许匿名 ListBucket + GetObject。',
-      );
-    }
+    final resp = await http
+        .get(listUri, headers: _cosHeaders(listUri, auth))
+        .timeout(const Duration(seconds: 20));
     if (resp.statusCode != 200) {
-      throw HttpException('对象储存列表请求失败（HTTP ${resp.statusCode}）');
+      _throwCosStatus(resp.statusCode, utf8.decode(resp.bodyBytes, allowMalformed: true), auth: auth);
     }
     final doc = XmlDocument.parse(utf8.decode(resp.bodyBytes));
     final result = <({String key, int size})>[];
@@ -124,9 +158,12 @@ class WorkshopService {
   }
 
   /// 探测 COS 四类目录是否含有效资产，返回可用 tag 列表。
-  static Future<List<String>> checkCosFolders(String baseUrl) async {
+  static Future<List<String>> checkCosFolders(
+    String baseUrl, {
+    CosAuth? auth,
+  }) async {
     try {
-      final objects = await listCosObjects(baseUrl);
+      final objects = await listCosObjects(baseUrl, auth: auth);
       final basePrefix = _cosBasePrefix(baseUrl);
 
       bool hasZip(String folder) =>
@@ -141,22 +178,25 @@ class WorkshopService {
         if (hasMd(kCosNoteFolder)) kUpdateNotifyTag,
       ];
     } on HttpException catch (e) {
-      if (!e.message.contains('403')) rethrow;
-      // 无匿名 List 时仍探测 Note，便于更新通知可用
+      // 匿名 List 失败时仍探测 Note；已配置密钥则不再匿名探测
+      if ((auth?.isConfigured ?? false) || !e.message.contains('403')) {
+        rethrow;
+      }
       final tags = await _probeCosNoteTag(baseUrl);
       if (tags.isNotEmpty) return tags;
       rethrow;
     }
   }
 
-  /// 探测固定 Note 文件名，返回可用 tag（仅在 ListObjects 失败时使用）。
+  /// 探测固定 Note 文件名，返回可用 tag（仅在匿名 ListObjects 失败时使用）。
   static Future<List<String>> _probeCosNoteTag(String baseUrl) async {
     final basePrefix = _cosBasePrefix(baseUrl);
     for (final name in const ['update.md', 'note.md', 'readme.md']) {
       final key = '$basePrefix$kCosNoteFolder/$name';
       try {
+        final url = Uri.parse(_cosDownloadUrl(baseUrl, key, basePrefix));
         final resp = await http
-            .get(Uri.parse(_cosDownloadUrl(baseUrl, key, basePrefix)))
+            .get(url)
             .timeout(const Duration(seconds: 10));
         if (resp.statusCode == 200) {
           return const [kUpdateNotifyTag];
@@ -169,8 +209,9 @@ class WorkshopService {
   /// 列出 COS 某分类下的 zip 资产（downloadUrl = BASE_URL + 编码后的相对 Key）。
   static Future<List<WorkshopAsset>> listCosAssets(
     String baseUrl,
-    String tag,
-  ) async {
+    String tag, {
+    CosAuth? auth,
+  }) async {
     if (!kWorkshopPackTags.contains(tag)) return const [];
     final folder = switch (tag) {
       kCharacterPackTag => kCosCharactersFolder,
@@ -180,7 +221,7 @@ class WorkshopService {
     };
     if (folder == null) return const [];
 
-    final objects = await listCosObjects(baseUrl);
+    final objects = await listCosObjects(baseUrl, auth: auth);
     final basePrefix = _cosBasePrefix(baseUrl);
     final folderPrefix = '$basePrefix$folder/';
     final assets = <WorkshopAsset>[];
@@ -202,10 +243,13 @@ class WorkshopService {
 
   /// 拉取 COS Note 目录更新通知 Markdown 全文。
   /// 优先级：`update.md` → `note.md` → `readme.md` → 目录中最后一个 `.md`。
-  /// ListObjects 失败时回退为按固定文件名探测。
-  static Future<String?> fetchCosNote(String baseUrl) async {
+  /// ListObjects 失败时（且未配置密钥）回退为按固定文件名探测。
+  static Future<String?> fetchCosNote(
+    String baseUrl, {
+    CosAuth? auth,
+  }) async {
     try {
-      final objects = await listCosObjects(baseUrl);
+      final objects = await listCosObjects(baseUrl, auth: auth);
       final basePrefix = _cosBasePrefix(baseUrl);
       final notePrefix = '$basePrefix$kCosNoteFolder/';
 
@@ -230,9 +274,11 @@ class WorkshopService {
       }
       pick ??= mdKeys.last;
 
-      return _getCosText(baseUrl, pick);
+      return _getCosText(baseUrl, pick, auth: auth);
     } on HttpException catch (e) {
-      if (!e.message.contains('403')) rethrow;
+      if ((auth?.isConfigured ?? false) || !e.message.contains('403')) {
+        rethrow;
+      }
       final basePrefix = _cosBasePrefix(baseUrl);
       for (final name in const ['update.md', 'note.md', 'readme.md']) {
         final body = await _getCosText(
@@ -245,10 +291,15 @@ class WorkshopService {
     }
   }
 
-  static Future<String?> _getCosText(String baseUrl, String key) async {
+  static Future<String?> _getCosText(
+    String baseUrl,
+    String key, {
+    CosAuth? auth,
+  }) async {
     final basePrefix = _cosBasePrefix(baseUrl);
+    final uri = Uri.parse(_cosDownloadUrl(baseUrl, key, basePrefix));
     final resp = await http
-        .get(Uri.parse(_cosDownloadUrl(baseUrl, key, basePrefix)))
+        .get(uri, headers: _cosHeaders(uri, auth))
         .timeout(const Duration(seconds: 20));
     if (resp.statusCode != 200) return null;
     return utf8.decode(resp.bodyBytes);
@@ -399,9 +450,11 @@ class WorkshopService {
 
   /// 下载 zip 到应用文档目录 workshop/ 下，实时回报进度（0.0~1.0）。
   /// [proxyUrl] 非空时通过加速代理前缀下载。返回本地绝对路径，失败返回 null。
+  /// [auth] 非空且已配置时，对 COS 私有对象签名 GET（此时忽略代理）。
   static Future<String?> downloadZip({
     required String downloadUrl,
     String proxyUrl = '',
+    CosAuth? auth,
     void Function(double progress)? onProgress,
   }) async {
     try {
@@ -415,9 +468,14 @@ class WorkshopService {
       // 已存在完整文件则跳过下载
       if (file.existsSync() && file.lengthSync() > 0) return file.path;
 
-      final finalUrl =
-          proxyUrl.isNotEmpty ? '$proxyUrl$downloadUrl' : downloadUrl;
+      // 私有读签名时不能走加速代理（签名绑定原 host）
+      final useAuth = auth?.isConfigured ?? false;
+      final useProxy = !useAuth && proxyUrl.isNotEmpty;
+      final finalUrl = useProxy ? '$proxyUrl$downloadUrl' : downloadUrl;
       final request = http.Request('GET', Uri.parse(finalUrl));
+      if (useAuth) {
+        request.headers.addAll(_cosHeaders(Uri.parse(finalUrl), auth));
+      }
       final resp = await http.Client().send(request);
       if (resp.statusCode != 200) return null;
 

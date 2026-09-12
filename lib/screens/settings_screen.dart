@@ -154,7 +154,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final String? body;
     final String emptyTip;
     if (notifyRepo.isCos) {
-      body = await WorkshopService.fetchCosNote(notifyRepo.url);
+      body = await WorkshopService.fetchCosNote(
+        notifyRepo.url,
+        auth: notifyRepo.hasCosAuth ? notifyRepo.cosAuth : null,
+      );
       emptyTip = '未找到 Note/*.md 或内容为空';
     } else {
       body = await WorkshopService.fetchReleaseBody(
