@@ -140,9 +140,12 @@ Map<String, String> _signTencentCos({
   // SignKey = hex(HMAC-SHA1(SecretKey, KeyTime))
   final signKeyHex = _hex(_hmacSha1(utf8.encode(secretKey), keyTime));
 
-  // UriPathname：与实际 HTTP 请求中的 path 一致（已编码）。
-  // Dart Uri.path 会解码，中文/特殊字符需按 segment 再 encode，否则 GET 对象 403。
-  final pathname = _encodePathForSign(uri);
+  // UriPathname：COS 官方示例中 HttpString 使用「解码后」的路径
+  // （请求行是 %E8%85%BE...，签名串是 腾讯云）。
+  // Dart Uri.path 保留百分号编码，必须用 pathSegments 还原。
+  final pathname = uri.pathSegments.isEmpty
+      ? '/'
+      : '/${uri.pathSegments.join('/')}';
 
   // UrlParamList / HttpParameters：key 小写并 UrlEncode，value UrlEncode，再按字典序排序
   final params = uri.queryParameters;
@@ -180,16 +183,6 @@ Map<String, String> _signTencentCos({
   };
 }
 
-/// 把 Dart 解码后的 path 重新按 segment 编码，对齐实际请求行。
-String _encodePathForSign(Uri uri) {
-  final raw = uri.path;
-  if (raw.isEmpty) return '/';
-  return raw
-      .split('/')
-      .map((s) => s.isEmpty ? '' : Uri.encodeComponent(s))
-      .join('/');
-}
-
 String _hex(List<int> bytes) =>
     bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
@@ -206,7 +199,11 @@ Map<String, String> _signAliyunOss({
   // 虚拟主机风格：host 第一段为 bucket 名
   final host = uri.host.toLowerCase();
   final bucket = host.split('.').first;
-  final objectKey = uri.path.isEmpty ? '/' : uri.path;
+  // OSS CanonicalizedResource 使用原始 Object Key（解码后的中文/括号），
+  // 与腾讯云「用请求行里已编码的 path」不同。
+  final objectKey = uri.pathSegments.isEmpty
+      ? '/'
+      : '/${uri.pathSegments.join('/')}';
 
   // 仅「子资源」参与 CanonicalizedResource；list 相关参数需纳入签名
   final params = uri.queryParameters;
