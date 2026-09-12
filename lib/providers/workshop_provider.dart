@@ -18,6 +18,12 @@ class WorkshopProvider extends ChangeNotifier {
   // 仓库 id -> tag -> 资产列表（内存缓存，避免重复请求）
   final Map<String, Map<String, List<WorkshopAsset>>> _assetsCache = {};
 
+  /// COS 仓库最近一次探测到的 Note 内容（变更检测后决定是否强制刷新）
+  final Map<String, ({String body, DateTime at})> _cosNoteState = {};
+
+  /// Note 变更探测间隔：窗口内再次进分类不再拉 Note
+  static const Duration _cosNoteCheckTtl = Duration(minutes: 5);
+
   /// 更新通知是否启用
   bool _notifyEnabled = false;
 
@@ -189,7 +195,9 @@ class WorkshopProvider extends ChangeNotifier {
         final tags = await WorkshopService.checkCosFolders(
           repo.url,
           auth: repo.hasCosAuth ? repo.cosAuth : null,
+          force: true,
         );
+        WorkshopService.invalidateCosListCache(repo.url);
         _repositories[index] = repo.copyWith(
           availableTags: tags,
           error: tags.isEmpty ? _cosEmptyTagError : null,
@@ -205,6 +213,8 @@ class WorkshopProvider extends ChangeNotifier {
       }
       // 清空该仓库的资产缓存，重新拉取
       _assetsCache.remove(repo.id);
+      _cosNoteState.remove(repo.id);
+      if (repo.isCos) WorkshopService.invalidateCosListCache(repo.url);
     } catch (e) {
       _repositories[index] = repo.copyWith(error: '$e');
     }
@@ -279,8 +289,41 @@ class WorkshopProvider extends ChangeNotifier {
   Future<void> removeRepository(String id) async {
     _repositories.removeWhere((r) => r.id == id);
     _assetsCache.remove(id);
+    _cosNoteState.remove(id);
     notifyListeners();
     await _persist();
+  }
+
+  /// 进分类时用 Note 内容做变更探测：
+  /// 与上次不同 → 清空 List/资产缓存强制刷新；相同或窗口内已探测 → 不拉。
+  Future<void> _syncCosIfNoteChanged(WorkshopRepository repo) async {
+    if (!repo.isCos) return;
+    final now = DateTime.now();
+    final state = _cosNoteState[repo.id];
+    if (state != null && now.difference(state.at) < _cosNoteCheckTtl) {
+      return;
+    }
+
+    String? note;
+    try {
+      note = await WorkshopService.probeCosNote(
+        repo.url,
+        auth: repo.hasCosAuth ? repo.cosAuth : null,
+      );
+    } catch (_) {
+      return; // 探测失败不阻断列表
+    }
+
+    if (note == null) {
+      _cosNoteState[repo.id] = (body: '', at: now);
+      return;
+    }
+    // 与本地已存 Note 不一致 → 强制刷新
+    if (state != null && state.body.isNotEmpty && note != state.body) {
+      WorkshopService.invalidateCosListCache(repo.url);
+      _assetsCache.remove(repo.id);
+    }
+    _cosNoteState[repo.id] = (body: note, at: now);
   }
 
   /// 拉取仓库某 tag 下的 zip 资产（带内存缓存）
@@ -288,6 +331,10 @@ class WorkshopProvider extends ChangeNotifier {
     WorkshopRepository repo,
     String tag,
   ) async {
+    // COS：先做 Note 变更探测（变了才清缓存）
+    if (repo.isCos) {
+      await _syncCosIfNoteChanged(repo);
+    }
     final cached = _assetsCache[repo.id]?[tag];
     if (cached != null) return cached;
     final List<WorkshopAsset> list;
@@ -373,6 +420,10 @@ class WorkshopProvider extends ChangeNotifier {
           notifyRepo.url,
           auth: notifyRepo.hasCosAuth ? notifyRepo.cosAuth : null,
         );
+        // 启动通知检查时记录 Note，供进分类时做变更对比
+        if (body != null) {
+          _cosNoteState[notifyRepo.id] = (body: body, at: DateTime.now());
+        }
       } else {
         body = await WorkshopService.fetchReleaseBody(
           notifyRepo.url,

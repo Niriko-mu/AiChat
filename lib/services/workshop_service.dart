@@ -32,6 +32,28 @@ class WorkshopService {
   /// COS 目录约定：更新通知 Markdown
   static const String kCosNoteFolder = 'Note';
 
+  /// ListObjects 结果内存缓存（短 TTL，避免同一会话内重复全量列举）
+  static final Map<String, ({DateTime at, List<({String key, int size})> objects})>
+      _cosListCache = {};
+  static const Duration _cosListCacheTtl = Duration(minutes: 5);
+
+  /// 清除 COS 列表缓存（仓库刷新时调用）
+  static void invalidateCosListCache([String? baseUrl]) {
+    if (baseUrl == null) {
+      _cosListCache.clear();
+      return;
+    }
+    final key = _cosListCacheKey(baseUrl, null);
+    _cosListCache.remove(key);
+    _cosListCache.removeWhere((k, _) => k.startsWith('$key|'));
+  }
+
+  static String _cosListCacheKey(String baseUrl, CosAuth? auth) {
+    final base = baseUrl.trim().replaceAll(RegExp(r'/+$'), '');
+    final ak = (auth?.isConfigured ?? false) ? auth!.accessKeyId.trim() : '';
+    return '$base|$ak';
+  }
+
   /// 是否像 COS 类对象储存 URL（完整 http(s) 且 host 非 GitHub / Gitee）。
   static bool looksLikeCosUrl(String input) {
     final s = input.trim();
@@ -117,10 +139,23 @@ class WorkshopService {
   }
 
   /// S3 ListObjects V2：GET {桶根}/?list-type=2&prefix={BASE路径}/&max-keys=1000
+  ///
+  /// 结果默认缓存约 5 分钟，供目录探测 / 资产列表 / 更新通知共用。
+  /// [force] 为 true 时跳过缓存（用户手动刷新）。
   static Future<List<({String key, int size})>> listCosObjects(
     String baseUrl, {
     CosAuth? auth,
+    bool force = false,
   }) async {
+    final cacheKey = _cosListCacheKey(baseUrl, auth);
+    if (!force) {
+      final hit = _cosListCache[cacheKey];
+      if (hit != null &&
+          DateTime.now().difference(hit.at) < _cosListCacheTtl) {
+        return hit.objects;
+      }
+    }
+
     final parsed = parseCosBaseUrl(baseUrl);
     final prefix = parsed.prefix.isEmpty ? '' : '${parsed.prefix}/';
     // 空 prefix 不可写入 queryParameters：Dart 会拼成 `prefix`（无 =），COS 返回 400
@@ -155,6 +190,7 @@ class WorkshopService {
       if (key == null || key.isEmpty) continue;
       result.add((key: key, size: size));
     }
+    _cosListCache[cacheKey] = (at: DateTime.now(), objects: result);
     return result;
   }
 
@@ -162,9 +198,10 @@ class WorkshopService {
   static Future<List<String>> checkCosFolders(
     String baseUrl, {
     CosAuth? auth,
+    bool force = false,
   }) async {
     try {
-      final objects = await listCosObjects(baseUrl, auth: auth);
+      final objects = await listCosObjects(baseUrl, auth: auth, force: force);
       final basePrefix = _cosBasePrefix(baseUrl);
 
       bool hasZip(String folder) =>
@@ -240,6 +277,26 @@ class WorkshopService {
       ));
     }
     return assets;
+  }
+
+  /// 轻量探测 Note 文件（不 List 整桶）：按 update.md → note.md → readme.md 顺序 GET。
+  /// 用于进分类前判断「通知内容是否变化」。找不到返回 null。
+  static Future<String?> probeCosNote(
+    String baseUrl, {
+    CosAuth? auth,
+  }) async {
+    final basePrefix = _cosBasePrefix(baseUrl);
+    for (final name in const ['update.md', 'note.md', 'readme.md']) {
+      try {
+        final body = await _getCosText(
+          baseUrl,
+          '$basePrefix$kCosNoteFolder/$name',
+          auth: auth,
+        );
+        if (body != null && body.isNotEmpty) return body;
+      } catch (_) {}
+    }
+    return null;
   }
 
   /// 拉取 COS Note 目录更新通知 Markdown 全文。
