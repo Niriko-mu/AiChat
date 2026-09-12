@@ -99,12 +99,39 @@ class WorkshopProvider extends ChangeNotifier {
     );
   }
 
-  /// 添加仓库：解析路径后自动检查可用性（是否有 V1.1.0 / V1.0.0 / V1.2.0 tag），再保存。
+  /// 添加仓库：按 type / 自动探测分流 Git / COS，检查可用性后保存。
   /// 检查失败或没有可用 tag 时抛出异常。
   Future<WorkshopRepository> addRepository({
     required String path,
     String proxyUrl = '',
+    String? type,
   }) async {
+    final repoType = _resolveRepoType(path, type);
+
+    if (repoType == WorkshopRepoType.cos) {
+      if (!WorkshopService.looksLikeCosUrl(path)) {
+        throw const FormatException(
+          'COS 来源需填写完整 http(s) BASE_URL（且不能为 GitHub / Gitee）',
+        );
+      }
+      final tags = await WorkshopService.checkCosFolders(path);
+      final repo = WorkshopRepository(
+        id: const Uuid().v4(),
+        name: WorkshopService.cosDisplayName(path),
+        url: path.trim(),
+        proxyUrl: '',
+        type: WorkshopRepoType.cos,
+        availableTags: tags,
+        error: tags.isEmpty
+            ? '未检测到 Characters / Games / Stickers / Note 目录'
+            : null,
+      );
+      _repositories.insert(0, repo);
+      notifyListeners();
+      await _persist();
+      return repo;
+    }
+
     final parsed = WorkshopService.parseRepoPath(path);
     if (parsed == null) {
       throw const FormatException('仓库路径格式不正确（需为 owner/repo 或完整仓库 URL）');
@@ -116,6 +143,7 @@ class WorkshopProvider extends ChangeNotifier {
       name: '${parsed.owner}/${parsed.repo}',
       url: path.trim(),
       proxyUrl: parsed.isGitee ? '' : proxyUrl,
+      type: WorkshopRepoType.git,
       availableTags: tags,
       error:
           tags.isEmpty ? '未检测到 V1.1.0 / V1.0.0 / V1.2.0 / V1.3.0 资产 tag' : null,
@@ -126,20 +154,41 @@ class WorkshopProvider extends ChangeNotifier {
     return repo;
   }
 
+  WorkshopRepoType _resolveRepoType(String path, String? type) {
+    if (type != null) {
+      return WorkshopRepoType.values.firstWhere(
+        (e) => e.name == type,
+        orElse: () => WorkshopService.detectRepoType(path),
+      );
+    }
+    return WorkshopService.detectRepoType(path);
+  }
+
+  static const _gitEmptyTagError =
+      '未检测到 V1.1.0 / V1.0.0 / V1.2.0 / V1.3.0 资产 tag';
+  static const _cosEmptyTagError =
+      '未检测到 Characters / Games / Stickers / Note 目录';
+
   /// 重新检查某个仓库的可用 tag（保留仓库其余配置）
   Future<void> refreshRepository(WorkshopRepository repo) async {
     final index = _repositories.indexWhere((r) => r.id == repo.id);
     if (index == -1) return;
-    final parsed = WorkshopService.parseRepoPath(repo.url);
-    if (parsed == null) return;
     try {
-      final tags = await WorkshopService.checkTags(repo.url);
-      _repositories[index] = repo.copyWith(
-        availableTags: tags,
-        error: tags.isEmpty
-            ? '未检测到 V1.1.0 / V1.0.0 / V1.2.0 / V1.3.0 资产 tag'
-            : null,
-      );
+      if (repo.isCos) {
+        final tags = await WorkshopService.checkCosFolders(repo.url);
+        _repositories[index] = repo.copyWith(
+          availableTags: tags,
+          error: tags.isEmpty ? _cosEmptyTagError : null,
+        );
+      } else {
+        final parsed = WorkshopService.parseRepoPath(repo.url);
+        if (parsed == null) return;
+        final tags = await WorkshopService.checkTags(repo.url);
+        _repositories[index] = repo.copyWith(
+          availableTags: tags,
+          error: tags.isEmpty ? _gitEmptyTagError : null,
+        );
+      }
       // 清空该仓库的资产缓存，重新拉取
       _assetsCache.remove(repo.id);
     } catch (e) {
@@ -149,28 +198,50 @@ class WorkshopProvider extends ChangeNotifier {
     await _persist();
   }
 
-  /// 修改仓库的路径/代理并重新检查可用性（保留仓库 id）。
+  /// 修改仓库的路径/代理/类型并重新检查可用性（保留仓库 id）。
   /// 检查失败或没有可用 tag 时抛出异常。
   Future<WorkshopRepository> updateRepository({
     required WorkshopRepository repo,
     required String path,
     String proxyUrl = '',
+    String? type,
   }) async {
-    final parsed = WorkshopService.parseRepoPath(path);
-    if (parsed == null) {
-      throw const FormatException('仓库路径格式不正确（需为 owner/repo 或完整仓库 URL）');
+    final repoType = _resolveRepoType(path, type ?? repo.type.name);
+    late final WorkshopRepository updated;
+
+    if (repoType == WorkshopRepoType.cos) {
+      if (!WorkshopService.looksLikeCosUrl(path)) {
+        throw const FormatException(
+          'COS 来源需填写完整 http(s) BASE_URL（且不能为 GitHub / Gitee）',
+        );
+      }
+      final tags = await WorkshopService.checkCosFolders(path);
+      updated = WorkshopRepository(
+        id: repo.id,
+        name: WorkshopService.cosDisplayName(path),
+        url: path.trim(),
+        proxyUrl: '',
+        type: WorkshopRepoType.cos,
+        availableTags: tags,
+        error: tags.isEmpty ? _cosEmptyTagError : null,
+      );
+    } else {
+      final parsed = WorkshopService.parseRepoPath(path);
+      if (parsed == null) {
+        throw const FormatException('仓库路径格式不正确（需为 owner/repo 或完整仓库 URL）');
+      }
+      final tags = await WorkshopService.checkTags(path);
+      updated = WorkshopRepository(
+        id: repo.id,
+        name: '${parsed.owner}/${parsed.repo}',
+        url: path.trim(),
+        proxyUrl: parsed.isGitee ? '' : proxyUrl,
+        type: WorkshopRepoType.git,
+        availableTags: tags,
+        error: tags.isEmpty ? _gitEmptyTagError : null,
+      );
     }
-    // 重新检查可用性（直连官方 API；代理仅用于下载，Gitee 固定直连）
-    final tags = await WorkshopService.checkTags(path);
-    final updated = WorkshopRepository(
-      id: repo.id,
-      name: '${parsed.owner}/${parsed.repo}',
-      url: path.trim(),
-      proxyUrl: parsed.isGitee ? '' : proxyUrl,
-      availableTags: tags,
-      error:
-          tags.isEmpty ? '未检测到 V1.1.0 / V1.0.0 / V1.2.0 / V1.3.0 资产 tag' : null,
-    );
+
     final index = _repositories.indexWhere((r) => r.id == repo.id);
     if (index != -1) _repositories[index] = updated;
     // 清空该仓库的资产缓存，重新拉取
@@ -194,16 +265,22 @@ class WorkshopProvider extends ChangeNotifier {
   ) async {
     final cached = _assetsCache[repo.id]?[tag];
     if (cached != null) return cached;
-    final parsed = WorkshopService.parseRepoPath(repo.url);
-    final list = parsed == null
-        ? const <WorkshopAsset>[]
-        : await WorkshopService.listAssets(repo.url, tag);
+    final List<WorkshopAsset> list;
+    if (repo.isCos) {
+      list = await WorkshopService.listCosAssets(repo.url, tag);
+    } else {
+      final parsed = WorkshopService.parseRepoPath(repo.url);
+      list = parsed == null
+          ? const <WorkshopAsset>[]
+          : await WorkshopService.listAssets(repo.url, tag);
+    }
     _assetsCache.putIfAbsent(repo.id, () => {})[tag] = list;
     return list;
   }
 
-  /// 查询仓库的下载代理（Gitee 仓库固定不使用代理）
+  /// 查询仓库的下载代理（Gitee / COS 仓库固定不使用代理）
   String proxyFor(WorkshopRepository repo) {
+    if (repo.isCos) return '';
     final parsed = WorkshopService.parseRepoPath(repo.url);
     return parsed != null && parsed.isGitee ? '' : repo.proxyUrl;
   }
@@ -252,11 +329,16 @@ class WorkshopProvider extends ChangeNotifier {
     if (notifyRepo == null) return null;
 
     try {
-      // 获取 V1.2.0 tag 的 release 描述
-      final body = await WorkshopService.fetchReleaseBody(
-        notifyRepo.url,
-        kUpdateNotifyTag,
-      );
+      // Git：读 V1.2.0 Release body；COS：读 Note/*.md 全文
+      final String? body;
+      if (notifyRepo.isCos) {
+        body = await WorkshopService.fetchCosNote(notifyRepo.url);
+      } else {
+        body = await WorkshopService.fetchReleaseBody(
+          notifyRepo.url,
+          kUpdateNotifyTag,
+        );
+      }
       if (body == null) return null;
 
       // 与上次内容比较

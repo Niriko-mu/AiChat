@@ -30,6 +30,7 @@
 - [持久化记忆（保存与导入 / 导出）](#持久化记忆保存与导入--导出)
 - [群聊功能](#群聊功能)
 - [创意工坊](#创意工坊)
+- [自行配置对象储存（COS / OSS）](#自行配置对象储存cos--oss)
 - [创意工坊表情包 ZIP 打包标准](#创意工坊表情包-zip-打包标准)
 - [自动发朋友圈与主动问候](#自动发朋友圈与主动问候)
 - [聊天背景与 UI 样式](#聊天背景与-ui-样式)
@@ -77,13 +78,14 @@
 
 ### 角色包与创意工坊
 - **角色包导入/导出**：`.zip` 角色包一键导入、导出，支持批量勾选
-- **创意工坊**：从 GitHub/Gitee 仓库下载角色包、游戏包和表情包
-  - 支持添加多个仓库，自动检测可用的 Release tag
+- **创意工坊**：从 GitHub/Gitee 仓库或 COS 类对象储存下载角色包、游戏包和表情包
+  - 支持添加多个仓库，自动检测可用的 Release tag / 目录
   - 角色分类（V1.1.0）：包含 Profile.json 的角色文件夹 zip
   - 游戏分类（V1.0.0）：包含 moments.json 的朋友圈数据包
   - 表情包分类（V1.3.0）：导入 ZIP 内的 GIF / WebP / PNG / JPG/JPEG 表情包，图片文件名自动作为备注
-  - 更新通知（V1.2.0）：接收仓库更新通知
+  - 更新通知（V1.2.0）：接收仓库更新通知（Git 读 Release body；COS 读 `Note/*.md`）
   - 支持 GitHub 下载代理加速
+  - 支持 COS 对象储存（腾讯云 COS / 阿里云 OSS / AWS S3 / MinIO 等，需匿名 List/Get）
 - **朋友圈数据包**：**【我】→ 管理当前朋友圈** 导入/导出角色的朋友圈数据包，支持勾选导出
 
 ### 记忆系统
@@ -511,7 +513,7 @@ App 内通过 **【我】→ 管理当前朋友圈** 管理朋友圈数据：顶
 
 ## 创意工坊
 
-创意工坊用于从 GitHub/Gitee 仓库下载角色包、游戏包和表情包。
+创意工坊用于从 GitHub/Gitee 仓库或 COS 类对象储存下载角色包、游戏包和表情包。
 
 ### 入口
 
@@ -520,9 +522,21 @@ App 内通过 **【我】→ 管理当前朋友圈** 管理朋友圈数据：顶
 ### 添加仓库
 
 1. 点击右上角「仓库管理」
-2. 输入仓库路径（如 `Murchey/AiChatApp` 或完整 URL）
-3. 可选配置 GitHub 下载代理
-4. 保存后自动检测仓库可用的 Release tag
+2. 点击右上角 **+**
+3. 粘贴或输入地址，App 会自动识别来源类型（弹窗内也可手动切换）：
+   - **Git**：`owner/repo` 或 GitHub / Gitee 完整 URL，可选配置下载代理
+   - **对象储存**：`https://` 的 BASE_URL（需桶允许匿名 ListObjects + GetObject）
+4. 保存后自动检测可用资产
+
+**对象储存 BASE_URL 示例**：
+
+```text
+https://aichatapp-1234567890.cos.ap-guangzhou.myqcloud.com
+https://my-bucket.oss-cn-hangzhou.aliyuncs.com
+https://my-bucket.oss-cn-hangzhou.aliyuncs.com/aichat
+```
+
+可以把整个桶根当作 BASE_URL，也可以把某个前缀目录（如 `/aichat`）当作 BASE_URL。
 
 ### 资产分类
 
@@ -530,6 +544,237 @@ App 内通过 **【我】→ 管理当前朋友圈** 管理朋友圈数据：顶
 - **游戏分类（V1.0.0）**：包含 `moments.json` 的朋友圈数据包，可导入为角色朋友圈
 - **表情包分类（V1.3.0）**：包含图片文件的表情包 ZIP，可导入到本地表情包库
 - **更新通知（V1.2.0）**：接收仓库更新通知
+
+### COS 对象储存目录约定
+
+使用 COS / OSS / S3 兼容对象储存时，App 按 BASE_URL 下的固定目录自动发现资产：
+
+```text
+{BASE_URL}/
+├── Characters/*.zip   # 角色分类
+├── Games/*.zip        # 游戏分类（朋友圈数据包）
+├── Stickers/*.zip     # 表情包分类
+└── Note/*.md          # 更新通知（Markdown，弹窗完整展示）
+```
+
+| 目录 | 资产 | 映射分类 |
+| ---- | ---- | -------- |
+| `Characters/` | `.zip` | 角色分类（V1.1.0） |
+| `Games/` | `.zip` | 游戏分类（V1.0.0） |
+| `Stickers/` | `.zip` | 表情包分类（V1.3.0） |
+| `Note/` | `.md` | 更新通知（V1.2.0） |
+
+**Note 优先级**：`update.md` → `note.md` → `readme.md` → 目录中最后一个 `.md`。
+
+**列表方式**：S3 ListObjects V2（`GET {桶根}/?list-type=2&prefix={BASE路径}/&max-keys=1000`）。当前未做分页，单次最多 1000 个对象。
+
+**权限要求**：桶需允许匿名 `ListObjects`（GET Bucket）与 `GetObject`（GET Object）。只开 Get 不开 List 时无法枚举 zip，App 会提示 HTTP 403。
+
+---
+
+## 自行配置对象储存（COS / OSS）
+
+本教程教你用自己的对象储存搭一个创意工坊来源，无需自建服务器。以**腾讯云 COS** 与**阿里云 OSS** 为例；其他兼容 S3 ListObjects 的服务（MinIO、AWS S3 等）原理相同。
+
+### 通用步骤概览
+
+1. 创建存储桶（Bucket）
+2. 上传目录结构（`Characters/`、`Games/`、`Stickers/`、`Note/`，需要哪类就传哪类）
+3. 开启匿名可读：至少允许 **列表对象** + **读取对象**
+4. 把访问域名填进 App 的「添加仓库 → 对象储存」
+
+---
+
+### 腾讯云 COS
+
+#### 1. 创建存储桶
+
+1. 打开 [腾讯云 COS 控制台](https://console.cloud.tencent.com/cos/bucket)
+2. **创建存储桶**
+   - 地域：例如 `ap-guangzhou`（建议选离用户近的地域）
+   - 访问权限：建议先选 **公有读私有写**（可后续再收紧）
+3. 记下访问域名，形如：
+
+```text
+https://<bucket-name>-<appid>.cos.<region>.myqcloud.com
+# 例：https://aichatapp-1398802649.cos.ap-guangzhou.myqcloud.com
+```
+
+#### 2. 上传目录与资产
+
+在控制台「文件列表」或使用 COSBrowser / coscli 上传：
+
+```text
+Characters/三月七.zip
+Games/示例朋友圈包.zip
+Stickers/表情包.zip
+Note/update.md
+```
+
+角色包 zip 内结构参见上文「如何添加角色」；表情包打包标准参见下节。
+
+#### 3. 配置匿名访问（关键）
+
+App 使用匿名 HTTP 访问，不需要 SecretId/SecretKey。
+
+**方式 A：公有读私有写（最简单）**
+
+存储桶 → 权限管理 → 访问公共权限 → **公有读私有写** → 保存。
+
+> 该设置会同时允许匿名「列表对象」和「读取对象」。
+
+**方式 B：Bucket Policy（更精细）**
+
+存储桶 → 权限管理 → Policy 设置 → 新增策略，示例（把资源路径换成你的桶）：
+
+```json
+{
+  "version": "2.0",
+  "statement": [
+    {
+      "effect": "allow",
+      "principal": {
+        "qcs": ["qcs::cam::anyone:anyone"]
+      },
+      "action": [
+        "name/cos:GetObject",
+        "name/cos:ListBucket"
+      ],
+      "resource": [
+        "qcs::cos:ap-guangzhou:uid/1398802649:aichatapp-1398802649.ap-guangzhou.myqcloud.com/*",
+        "qcs::cos:ap-guangzhou:uid/1398802649:aichatapp-1398802649.ap-guangzhou.myqcloud.com"
+      ]
+    }
+  ]
+}
+```
+
+说明：
+
+| 动作 | 对应 API | 作用 |
+| ---- | -------- | ---- |
+| `name/cos:GetObject` | GET Object | 下载 zip / md |
+| `name/cos:ListBucket` | GET Bucket（查询对象列表） | 列出 `Characters/` 等目录 |
+
+只开 GetObject、不开 ListBucket 时，App 会报 **HTTP 403**，无法发现资产。
+
+#### 4. 在 App 中添加
+
+创意工坊设置 → **+** → 粘贴：
+
+```text
+https://aichatapp-1398802649.cos.ap-guangzhou.myqcloud.com
+```
+
+保存后应能看到「角色 / 游戏 / 表情包」分类 chip；若只有「更新通知」，通常说明 List 权限仍未打开。
+
+#### 5. 发布更新通知
+
+在桶内创建 `Note/update.md`（或 `note.md` / `readme.md`），内容为 Markdown。变更文件内容后，把该 COS 仓库设为通知源，下次启动会完整弹窗展示。
+
+---
+
+### 阿里云 OSS
+
+#### 1. 创建 Bucket
+
+1. 打开 [阿里云 OSS 控制台](https://oss.console.aliyun.com/bucket)
+2. **创建 Bucket**
+   - Region：例如华东 1（杭州）
+   - 读写权限：建议先选 **公共读**
+3. 记下外网 Endpoint 与访问域名，形如：
+
+```text
+https://<bucket-name>.oss-cn-hangzhou.aliyuncs.com
+```
+
+若只把某个前缀当作工坊根目录，BASE_URL 可写成：
+
+```text
+https://<bucket-name>.oss-cn-hangzhou.aliyuncs.com/aichat
+```
+
+对应对象前缀为 `aichat/Characters/...` 等。
+
+#### 2. 上传目录与资产
+
+与 COS 相同，保持固定目录名（大小写敏感）：
+
+```text
+Characters/*.zip
+Games/*.zip
+Stickers/*.zip
+Note/*.md
+```
+
+可用控制台拖拽上传，或 `ossutil`：
+
+```bash
+ossutil cp -r ./Characters oss://my-bucket/Characters/
+ossutil cp ./Note/update.md oss://my-bucket/Note/update.md
+```
+
+#### 3. 配置匿名访问（关键）
+
+**方式 A：Bucket 读写权限为「公共读」（最简单）**
+
+Bucket → 权限管理 → 读写权限 → **公共读**。
+
+**方式 B：Bucket 授权策略（更精细）**
+
+Bucket → 权限管理 → Bucket 授权策略 → 新增授权：
+
+- 授权用户：**全部账号（包括匿名访问）**
+- 授权资源：整个 Bucket 或指定前缀 `my-bucket/*`
+- 授权操作：至少勾选
+  - `oss:ListObjects`（列表对象）
+  - `oss:GetObject`（读取对象）
+
+> 阿里云「公共读」通常已包含匿名 List + Get；若只对单个文件做了公共读而未开放 List，App 同样无法枚举资产。
+
+#### 4. 在 App 中添加
+
+```text
+https://my-bucket.oss-cn-hangzhou.aliyuncs.com
+```
+
+或：
+
+```text
+https://my-bucket.oss-cn-hangzhou.aliyuncs.com/aichat
+```
+
+#### 5. CORS（可选）
+
+App 走的是原生 HTTP，一般**不需要**配置 CORS。若你用网页端预览桶内容并跨域访问，再在「数据安全 → 跨域设置」中添加允许来源。
+
+---
+
+### 自检清单
+
+配置完成后，可用浏览器或命令行快速验证：
+
+```bash
+# 应返回 XML 列表（200），而不是 403/400
+curl -i "https://你的桶域名/?list-type=2&max-keys=1000"
+
+# 应能直接下载
+curl -I "https://你的桶域名/Note/update.md"
+```
+
+| 现象 | 可能原因 |
+| ---- | -------- |
+| HTTP 403 | 未允许匿名 ListBucket / GetObject |
+| HTTP 400 | 请求参数异常；或 BASE_URL / 域名写错 |
+| 保存成功但只有「更新通知」 | Note 可 Get，但 List 仍不可用，无法枚举 zip |
+| 分类出现但下载失败 | 单个对象未对匿名开放，或 URL 中文未正确编码 |
+| 一直空列表 | 目录名不是 `Characters` / `Games` / `Stickers` / `Note`（区分大小写），或 zip 放在了子目录里 |
+
+### 安全建议
+
+- 该桶**只放**可公开的角色包 / 表情包 / 通知，不要上传密钥、隐私数据
+- 不需要公网 List 时，可将 BASE_URL 收窄到某个前缀，并只对该前缀授权
+- 付费/私有内容请另寻鉴权方案：当前实现仅支持匿名 List + Get
 
 ---
 
@@ -588,16 +833,18 @@ ZIP 内可直接放图片，也可以像普通表情包一样用一个最外层�
 1. 新建一个表情包文件夹，例如 `大肥鱼表情包`；
 2. 将 GIF、WebP、PNG、JPG/JPEG 图片放入该文件夹，并按语义为每张图片命名；
 3. 压缩**文件夹本身**为 ZIP，例如 `大肥鱼表情包.zip`；
-4. 在创意工坊仓库的 `V1.3.0` Release 中上传该 ZIP 作为资产；
+4. 发布到创意工坊来源：
+   - **Git**：在仓库的 `V1.3.0` Release 中上传该 ZIP 作为资产；
+   - **对象储存**：上传到 `Stickers/大肥鱼表情包.zip`；
 5. 用户在 App 的 **【我】→ 创意工坊 → 表情包分类** 勾选并下载导入。
 
 导入完成后，表情包会显示在聊天输入框的表情包面板中，并可在 **【我】→ 设置 → 管理表情包** 查看、编辑或删除。
 
 ### 更新通知
 
-- 在仓库管理页面可开启「更新通知」
-- 开启后，应用启动时会检查仓库是否有新的 Release
-- 有新 Release 时，应用内会弹出通知
+- 在仓库管理页面可开启「更新通知」，并选择通知仓库
+- **Git**：启动时检查是否有新的 `V1.2.0` Release；Release 描述变化时弹窗
+- **对象储存**：启动时拉取 `Note/*.md`（优先 `update.md`）；内容变化时完整弹窗展示 Markdown
 
 ---
 

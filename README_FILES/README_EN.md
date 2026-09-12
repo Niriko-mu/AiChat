@@ -27,6 +27,7 @@ A **roleplay-style WeChat chat app** built with Flutter for Android. Features mu
 - [Persistent Memories (Save & Import / Export)](#persistent-memories-save--import--export)
 - [Group Chat](#group-chat)
 - [Workshop](#workshop)
+- [Self-Hosting Object Storage (COS / OSS)](#self-hosting-object-storage-cos--oss)
 - [Auto-Post Moments & Proactive Greeting](#auto-post-moments--proactive-greeting)
 - [Chat Background & UI Styles](#chat-background--ui-styles)
 - [Token Usage Statistics](#token-usage-statistics)
@@ -75,12 +76,14 @@ A **roleplay-style WeChat chat app** built with Flutter for Android. Features mu
 ### Character Packs & Workshop
 
 - **Character Pack Import/Export**: One-click `.zip` character pack import/export, supports batch selection.
-- **Workshop**: Download character packs and game packs from GitHub/Gitee repositories.
-  - Support adding multiple repositories with auto-detection of available Release tags.
+- **Workshop**: Download character packs and game packs from GitHub/Gitee repositories or COS-compatible object storage.
+  - Support adding multiple repositories with auto-detection of available Release tags / folders.
   - **Characters Category (V1.1.0)**: ZIP files containing character folders with `Profile.json`.
   - **Games Category (V1.0.0)**: Moments data packs containing `moments.json`.
-  - **Update Notifications (V1.2.0)**: Receive repository update notifications.
+  - **Stickers Category (V1.3.0)**: Sticker ZIP packs (GIF / WebP / PNG / JPG/JPEG); filenames become notes.
+  - **Update Notifications (V1.2.0)**: Receive repository update notifications (Git reads Release body; COS reads `Note/*.md`).
   - Support GitHub download proxy acceleration.
+  - Support COS-compatible object storage (Tencent COS / Aliyun OSS / AWS S3 / MinIO, anonymous List/Get required).
 - **Moments Data Pack**: **Me → Manage Moments** to import/export character Moments data packs with selective export.
 
 ### Memory System
@@ -459,7 +462,7 @@ Inside a group chat, tap "..." at top-right → "Group Chat Settings" to configu
 
 ## Workshop
 
-The Workshop is used to download character packs and game packs from GitHub/Gitee repositories.
+The Workshop is used to download character packs and game packs from GitHub/Gitee repositories or COS-compatible object storage.
 
 ### Access
 
@@ -468,21 +471,247 @@ The Workshop is used to download character packs and game packs from GitHub/Gite
 ### Adding Repositories
 
 1. Tap "Repository Management" at top-right.
-2. Enter the repository path (e.g., `Murchey/AiChatApp` or full URL).
-3. Optionally configure a GitHub download proxy.
-4. After saving, the app automatically detects available Release tags.
+2. Tap **+**.
+3. Paste or enter a path. The app auto-detects the source type (you can still switch it in the dialog):
+   - **Git**: `owner/repo` or a full GitHub / Gitee URL; optional download proxy.
+   - **Object storage**: an `https://` BASE_URL (bucket must allow anonymous ListObjects + GetObject).
+4. After saving, the app automatically detects available assets.
+
+**Object storage BASE_URL examples**:
+
+```text
+https://aichatapp-1234567890.cos.ap-guangzhou.myqcloud.com
+https://my-bucket.oss-cn-hangzhou.aliyuncs.com
+https://my-bucket.oss-cn-hangzhou.aliyuncs.com/aichat
+```
+
+You can use the bucket root as BASE_URL, or a path prefix such as `/aichat`.
 
 ### Asset Categories
 
 - **Characters Category (V1.1.0)**: ZIP files containing character folders with `Profile.json`, directly importable as characters.
 - **Games Category (V1.0.0)**: Moments data packs containing `moments.json`, importable as character Moments.
+- **Stickers Category (V1.3.0)**: Sticker ZIP packs, importable into the local sticker library.
 - **Update Notifications (V1.2.0)**: Receive repository update notifications.
 
-### Update Notifications
+### COS Object Storage Directory Convention
 
-- Enable "Update Notifications" in Repository Management.
-- When enabled, the app checks for new Releases on startup.
-- If a new Release exists, an in-app notification appears.
+When using COS / OSS / S3-compatible object storage, the app auto-discovers assets under the BASE_URL with a fixed layout:
+
+```text
+{BASE_URL}/
+├── Characters/*.zip   # Characters
+├── Games/*.zip        # Games (Moments packs)
+├── Stickers/*.zip     # Stickers
+└── Note/*.md          # Update notes (Markdown, shown in full in a dialog)
+```
+
+| Folder | Assets | Mapped category |
+| ------ | ------ | --------------- |
+| `Characters/` | `.zip` | Characters (V1.1.0) |
+| `Games/` | `.zip` | Games (V1.0.0) |
+| `Stickers/` | `.zip` | Stickers (V1.3.0) |
+| `Note/` | `.md` | Update notifications (V1.2.0) |
+
+**Note priority**: `update.md` → `note.md` → `readme.md` → last `.md` in the folder.
+
+**Listing**: S3 ListObjects V2 (`GET {bucket-root}/?list-type=2&prefix={base-path}/&max-keys=1000`). Pagination is not implemented yet; up to 1000 objects per request.
+
+**Permissions**: the bucket must allow anonymous **ListObjects** (GET Bucket) and **GetObject** (GET Object). If only GetObject is allowed, the app cannot enumerate zips and will show HTTP 403.
+
+---
+
+## Self-Hosting Object Storage (COS / OSS)
+
+This tutorial shows how to run a Workshop source on your own object storage — no server required. Examples cover **Tencent COS** and **Aliyun OSS**. MinIO / AWS S3 work the same way if they support S3 ListObjects.
+
+### Overview
+
+1. Create a bucket
+2. Upload the directory layout (`Characters/`, `Games/`, `Stickers/`, `Note/` — only what you need)
+3. Allow anonymous read: at least **ListObjects** + **GetObject**
+4. Paste the access domain into the app as an object-storage repository
+
+---
+
+### Tencent COS
+
+#### 1. Create a bucket
+
+1. Open the [Tencent COS console](https://console.cloud.tencent.com/cos/bucket)
+2. **Create bucket**
+   - Region: e.g. `ap-guangzhou`
+   - Access: **Public read / private write** is the easiest starting point
+3. Note the access domain:
+
+```text
+https://<bucket-name>-<appid>.cos.<region>.myqcloud.com
+# e.g. https://aichatapp-1398802649.cos.ap-guangzhou.myqcloud.com
+```
+
+#### 2. Upload folders and assets
+
+Via console, COSBrowser, or coscli:
+
+```text
+Characters/March7th.zip
+Games/sample-moments.zip
+Stickers/pack.zip
+Note/update.md
+```
+
+See the character-pack section above for zip layout; see the sticker packing standard below.
+
+#### 3. Enable anonymous access (required)
+
+The app uses anonymous HTTP — no SecretId/SecretKey.
+
+**Option A: Public read / private write**
+
+Bucket → Permission → Public access → **Public read, private write**.
+
+> This allows both anonymous list and get.
+
+**Option B: Bucket Policy**
+
+Bucket → Permission → Policy. Example (replace region / uid / bucket):
+
+```json
+{
+  "version": "2.0",
+  "statement": [
+    {
+      "effect": "allow",
+      "principal": {
+        "qcs": ["qcs::cam::anyone:anyone"]
+      },
+      "action": [
+        "name/cos:GetObject",
+        "name/cos:ListBucket"
+      ],
+      "resource": [
+        "qcs::cos:ap-guangzhou:uid/1398802649:aichatapp-1398802649.ap-guangzhou.myqcloud.com/*",
+        "qcs::cos:ap-guangzhou:uid/1398802649:aichatapp-1398802649.ap-guangzhou.myqcloud.com"
+      ]
+    }
+  ]
+}
+```
+
+| Action | API | Purpose |
+| ------ | --- | ------- |
+| `name/cos:GetObject` | GET Object | Download zip / md |
+| `name/cos:ListBucket` | GET Bucket (list objects) | Discover folders |
+
+Get without List → app shows **HTTP 403**.
+
+#### 4. Add in the app
+
+Workshop settings → **+** → paste:
+
+```text
+https://aichatapp-1398802649.cos.ap-guangzhou.myqcloud.com
+```
+
+#### 5. Update notes
+
+Create `Note/update.md` (or `note.md` / `readme.md`). After content changes, set this COS repo as the notify source; the full Markdown is shown on next launch.
+
+---
+
+### Aliyun OSS
+
+#### 1. Create a bucket
+
+1. Open the [Aliyun OSS console](https://oss.console.aliyun.com/bucket)
+2. **Create bucket**
+   - Region: e.g. China East 1 (Hangzhou)
+   - ACL: **Public read** is the easiest starting point
+3. Note the public endpoint:
+
+```text
+https://<bucket-name>.oss-cn-hangzhou.aliyuncs.com
+```
+
+To scope the workshop to a prefix:
+
+```text
+https://<bucket-name>.oss-cn-hangzhou.aliyuncs.com/aichat
+```
+
+Objects then live under `aichat/Characters/...`.
+
+#### 2. Upload folders and assets
+
+Same fixed folder names (case-sensitive):
+
+```text
+Characters/*.zip
+Games/*.zip
+Stickers/*.zip
+Note/*.md
+```
+
+```bash
+ossutil cp -r ./Characters oss://my-bucket/Characters/
+ossutil cp ./Note/update.md oss://my-bucket/Note/update.md
+```
+
+#### 3. Enable anonymous access (required)
+
+**Option A: Bucket ACL = Public read**
+
+Bucket → Permission → ACL → **Public read**.
+
+**Option B: Bucket authorization policy**
+
+Bucket → Permission → Bucket authorization → add:
+
+- Grantee: **Any account including anonymous**
+- Resource: whole bucket or prefix `my-bucket/*`
+- Actions: at least
+  - `oss:ListObjects`
+  - `oss:GetObject`
+
+> Public read usually includes anonymous list + get. Allowing only individual object reads (no list) will still prevent the app from discovering zips.
+
+#### 4. Add in the app
+
+```text
+https://my-bucket.oss-cn-hangzhou.aliyuncs.com
+# or
+https://my-bucket.oss-cn-hangzhou.aliyuncs.com/aichat
+```
+
+#### 5. CORS (optional)
+
+The app uses native HTTP, so CORS is generally **not required**. Configure CORS only if a browser page will access the bucket.
+
+---
+
+### Self-check
+
+```bash
+# Should return XML listing (200), not 403/400
+curl -i "https://your-bucket-domain/?list-type=2&max-keys=1000"
+
+# Should download directly
+curl -I "https://your-bucket-domain/Note/update.md"
+```
+
+| Symptom | Likely cause |
+| ------- | ------------ |
+| HTTP 403 | Anonymous ListBucket / GetObject not allowed |
+| HTTP 400 | Bad request params or wrong BASE_URL / domain |
+| Saved with only "Update notes" | Note is readable, but List is still denied |
+| Categories appear but download fails | That object is not public, or CJK path encoding issue |
+| Always empty list | Folder names wrong (case-sensitive), or zips nested too deep |
+
+### Security notes
+
+- Put only publicly shareable packs / notes in this bucket — never keys or private data
+- Prefer a narrow BASE_URL prefix if the whole bucket need not be listed
+- Paid/private content needs real auth: current implementation is anonymous List + Get only
 
 ---
 

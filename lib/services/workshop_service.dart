@@ -2,7 +2,9 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
+import 'package:xml/xml.dart';
 import '../models/workshop_asset.dart';
+import '../models/workshop_repository.dart';
 
 /// 创意工坊仓库服务：检查仓库 Release tag 可用性、拉取资产 zip、下载 zip。
 ///
@@ -11,7 +13,281 @@ import '../models/workshop_asset.dart';
 ///   V1.0.0 = 游戏分类角色包（zip 内含 moments.json 的朋友圈数据包）
 /// 支持 GitHub 与 Gitee 仓库；检测与资产拉取直连官方 API，
 /// 代理仅用于 zip 下载加速（仅对 GitHub 生效，Gitee 始终直连）。
+///
+/// 另支持 COS 类对象储存（腾讯云 COS / 阿里云 OSS / AWS S3 / MinIO 等）：
+/// 用户填写 BASE_URL，App 按固定目录约定自动发现资产（需匿名 ListObjects + GetObject）。
 class WorkshopService {
+  /// COS 目录约定：角色分类
+  static const String kCosCharactersFolder = 'Characters';
+
+  /// COS 目录约定：游戏分类
+  static const String kCosGamesFolder = 'Games';
+
+  /// COS 目录约定：表情包分类
+  static const String kCosStickersFolder = 'Stickers';
+
+  /// COS 目录约定：更新通知 Markdown
+  static const String kCosNoteFolder = 'Note';
+
+  /// 是否像 COS 类对象储存 URL（完整 http(s) 且 host 非 GitHub / Gitee）。
+  static bool looksLikeCosUrl(String input) {
+    final s = input.trim();
+    if (s.isEmpty) return false;
+    final uri = Uri.tryParse(s);
+    if (uri == null) return false;
+    if (!uri.isScheme('http') && !uri.isScheme('https')) return false;
+    final host = uri.host.toLowerCase();
+    if (host.isEmpty) return false;
+    if (host.contains('github.com') || host.contains('gitee.com')) {
+      return false;
+    }
+    return true;
+  }
+
+  /// 解析 COS BASE_URL：列表打在桶根，路径前缀用于 ListObjects prefix。
+  /// 返回 `(bucketRoot: scheme://host[:port], prefix: 无首尾斜杠的路径)`。
+  static ({Uri bucketRoot, String prefix}) parseCosBaseUrl(String url) {
+    final trimmed = url.trim().replaceAll(RegExp(r'/+$'), '');
+    final uri = Uri.parse(trimmed);
+    final path =
+        uri.path.replaceAll(RegExp(r'^/+'), '').replaceAll(RegExp(r'/+$'), '');
+    final bucketRoot = Uri(
+      scheme: uri.scheme,
+      host: uri.host,
+      port: uri.hasPort ? uri.port : null,
+    );
+    return (bucketRoot: bucketRoot, prefix: path);
+  }
+
+  /// COS 仓库显示名：`host/末级路径`（无路径时仅 host）。
+  static String cosDisplayName(String url) {
+    final parsed = parseCosBaseUrl(url);
+    final host = parsed.bucketRoot.host;
+    final segs =
+        parsed.prefix.split('/').where((s) => s.isNotEmpty).toList(growable: false);
+    if (segs.isEmpty) return host;
+    return '$host/${segs.last}';
+  }
+
+  /// 检测输入应归为 Git 还是 COS 仓库。
+  static WorkshopRepoType detectRepoType(String input) {
+    final p = input.trim();
+    if (p.isEmpty) return WorkshopRepoType.git;
+    if (!p.contains('://')) return WorkshopRepoType.git;
+    return looksLikeCosUrl(p) ? WorkshopRepoType.cos : WorkshopRepoType.git;
+  }
+
+  /// S3 ListObjects V2：GET {桶根}/?list-type=2&prefix={BASE路径}/&max-keys=1000
+  static Future<List<({String key, int size})>> listCosObjects(
+    String baseUrl,
+  ) async {
+    final parsed = parseCosBaseUrl(baseUrl);
+    final prefix = parsed.prefix.isEmpty ? '' : '${parsed.prefix}/';
+    // 空 prefix 不可写入 queryParameters：Dart 会拼成 `prefix`（无 =），COS 返回 400
+    final listUri = parsed.bucketRoot.replace(
+      path: '/',
+      queryParameters: {
+        'list-type': '2',
+        if (prefix.isNotEmpty) 'prefix': prefix,
+        'max-keys': '1000',
+      },
+    );
+    final resp =
+        await http.get(listUri).timeout(const Duration(seconds: 20));
+    if (resp.statusCode == 403) {
+      throw const HttpException(
+        '对象储存拒绝匿名列表（HTTP 403）。请在控制台为该桶开启公有读，'
+        '或配置 Bucket Policy 允许匿名 ListBucket + GetObject。',
+      );
+    }
+    if (resp.statusCode != 200) {
+      throw HttpException('对象储存列表请求失败（HTTP ${resp.statusCode}）');
+    }
+    final doc = XmlDocument.parse(utf8.decode(resp.bodyBytes));
+    final result = <({String key, int size})>[];
+    // 按 local name 匹配，兼容带默认命名空间或前缀的 S3/COS 响应
+    for (final content in doc.descendantElements) {
+      if (content.name.local != 'Contents') continue;
+      String? key;
+      var size = 0;
+      for (final child in content.childElements) {
+        if (child.name.local == 'Key') {
+          key = child.innerText.trim();
+        } else if (child.name.local == 'Size') {
+          size = int.tryParse(child.innerText.trim()) ?? 0;
+        }
+      }
+      if (key == null || key.isEmpty) continue;
+      result.add((key: key, size: size));
+    }
+    return result;
+  }
+
+  /// 探测 COS 四类目录是否含有效资产，返回可用 tag 列表。
+  static Future<List<String>> checkCosFolders(String baseUrl) async {
+    try {
+      final objects = await listCosObjects(baseUrl);
+      final basePrefix = _cosBasePrefix(baseUrl);
+
+      bool hasZip(String folder) =>
+          _hasTopLevelFiles(objects, '$basePrefix$folder/', '.zip');
+      bool hasMd(String folder) =>
+          _hasTopLevelFiles(objects, '$basePrefix$folder/', '.md');
+
+      return [
+        if (hasZip(kCosCharactersFolder)) kCharacterPackTag,
+        if (hasZip(kCosGamesFolder)) kGamePackTag,
+        if (hasZip(kCosStickersFolder)) kStickerPackTag,
+        if (hasMd(kCosNoteFolder)) kUpdateNotifyTag,
+      ];
+    } on HttpException catch (e) {
+      if (!e.message.contains('403')) rethrow;
+      // 无匿名 List 时仍探测 Note，便于更新通知可用
+      final tags = await _probeCosNoteTag(baseUrl);
+      if (tags.isNotEmpty) return tags;
+      rethrow;
+    }
+  }
+
+  /// 探测固定 Note 文件名，返回可用 tag（仅在 ListObjects 失败时使用）。
+  static Future<List<String>> _probeCosNoteTag(String baseUrl) async {
+    final basePrefix = _cosBasePrefix(baseUrl);
+    for (final name in const ['update.md', 'note.md', 'readme.md']) {
+      final key = '$basePrefix$kCosNoteFolder/$name';
+      try {
+        final resp = await http
+            .get(Uri.parse(_cosDownloadUrl(baseUrl, key, basePrefix)))
+            .timeout(const Duration(seconds: 10));
+        if (resp.statusCode == 200) {
+          return const [kUpdateNotifyTag];
+        }
+      } catch (_) {}
+    }
+    return const [];
+  }
+
+  /// 列出 COS 某分类下的 zip 资产（downloadUrl = BASE_URL + 编码后的相对 Key）。
+  static Future<List<WorkshopAsset>> listCosAssets(
+    String baseUrl,
+    String tag,
+  ) async {
+    if (!kWorkshopPackTags.contains(tag)) return const [];
+    final folder = switch (tag) {
+      kCharacterPackTag => kCosCharactersFolder,
+      kGamePackTag => kCosGamesFolder,
+      kStickerPackTag => kCosStickersFolder,
+      _ => null,
+    };
+    if (folder == null) return const [];
+
+    final objects = await listCosObjects(baseUrl);
+    final basePrefix = _cosBasePrefix(baseUrl);
+    final folderPrefix = '$basePrefix$folder/';
+    final assets = <WorkshopAsset>[];
+    for (final o in objects) {
+      if (!o.key.startsWith(folderPrefix)) continue;
+      final name = o.key.substring(folderPrefix.length);
+      if (name.isEmpty || name.contains('/')) continue;
+      if (!name.toLowerCase().endsWith('.zip')) continue;
+      assets.add(WorkshopAsset(
+        tag: tag,
+        name: name,
+        label: '',
+        downloadUrl: _cosDownloadUrl(baseUrl, o.key, basePrefix),
+        sizeBytes: o.size,
+      ));
+    }
+    return assets;
+  }
+
+  /// 拉取 COS Note 目录更新通知 Markdown 全文。
+  /// 优先级：`update.md` → `note.md` → `readme.md` → 目录中最后一个 `.md`。
+  /// ListObjects 失败时回退为按固定文件名探测。
+  static Future<String?> fetchCosNote(String baseUrl) async {
+    try {
+      final objects = await listCosObjects(baseUrl);
+      final basePrefix = _cosBasePrefix(baseUrl);
+      final notePrefix = '$basePrefix$kCosNoteFolder/';
+
+      final mdKeys = objects
+          .where((o) =>
+              o.key.startsWith(notePrefix) &&
+              o.key.toLowerCase().endsWith('.md') &&
+              !o.key.substring(notePrefix.length).contains('/'))
+          .map((o) => o.key)
+          .toList(growable: false);
+      if (mdKeys.isEmpty) return null;
+
+      String? pick;
+      for (final preferred in const ['update.md', 'note.md', 'readme.md']) {
+        for (final k in mdKeys) {
+          if (k.substring(notePrefix.length).toLowerCase() == preferred) {
+            pick = k;
+            break;
+          }
+        }
+        if (pick != null) break;
+      }
+      pick ??= mdKeys.last;
+
+      return _getCosText(baseUrl, pick);
+    } on HttpException catch (e) {
+      if (!e.message.contains('403')) rethrow;
+      final basePrefix = _cosBasePrefix(baseUrl);
+      for (final name in const ['update.md', 'note.md', 'readme.md']) {
+        final body = await _getCosText(
+          baseUrl,
+          '$basePrefix$kCosNoteFolder/$name',
+        );
+        if (body != null && body.isNotEmpty) return body;
+      }
+      return null;
+    }
+  }
+
+  static Future<String?> _getCosText(String baseUrl, String key) async {
+    final basePrefix = _cosBasePrefix(baseUrl);
+    final resp = await http
+        .get(Uri.parse(_cosDownloadUrl(baseUrl, key, basePrefix)))
+        .timeout(const Duration(seconds: 20));
+    if (resp.statusCode != 200) return null;
+    return utf8.decode(resp.bodyBytes);
+  }
+
+  static String _cosBasePrefix(String baseUrl) {
+    final prefix = parseCosBaseUrl(baseUrl).prefix;
+    return prefix.isEmpty ? '' : '$prefix/';
+  }
+
+  static bool _hasTopLevelFiles(
+    List<({String key, int size})> objects,
+    String folderPrefix,
+    String ext,
+  ) {
+    final lowerExt = ext.toLowerCase();
+    for (final o in objects) {
+      if (!o.key.startsWith(folderPrefix)) continue;
+      final name = o.key.substring(folderPrefix.length);
+      if (name.isEmpty || name.contains('/')) continue;
+      if (name.toLowerCase().endsWith(lowerExt)) return true;
+    }
+    return false;
+  }
+
+  /// BASE_URL + 编码后的相对 Key（相对路径按 segment 做 encodeComponent）。
+  static String _cosDownloadUrl(
+    String baseUrl,
+    String key,
+    String basePrefix,
+  ) {
+    final relative =
+        key.startsWith(basePrefix) ? key.substring(basePrefix.length) : key;
+    final encoded =
+        relative.split('/').map(Uri.encodeComponent).join('/');
+    final base = baseUrl.trim().replaceAll(RegExp(r'/+$'), '');
+    return '$base/$encoded';
+  }
+
   /// 解析仓库路径为 owner/repo 与来源平台。
   ///
   /// 兼容 `owner/repo` 与完整 URL（https://github.com/owner/repo、https://gitee.com/owner/repo）。
