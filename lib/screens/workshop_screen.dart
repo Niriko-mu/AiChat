@@ -1099,7 +1099,7 @@ class _BatchDownloadDialogState extends State<_BatchDownloadDialog> {
           builder: (ctx) => CupertinoAlertDialog(
             title: const Text('下载失败'),
             content: Text(
-              '「${item.asset.displayName}」下载失败，请检查网络或代理设置',
+              '「${item.asset.displayName}」下载失败，请检查网络、密钥权限或稍后重试',
               textAlign: TextAlign.center,
             ),
             actions: [

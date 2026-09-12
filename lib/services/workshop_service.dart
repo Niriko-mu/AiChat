@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:xml/xml.dart';
@@ -477,7 +478,13 @@ class WorkshopService {
         request.headers.addAll(_cosHeaders(Uri.parse(finalUrl), auth));
       }
       final resp = await http.Client().send(request);
-      if (resp.statusCode != 200) return null;
+      if (resp.statusCode != 200) {
+        debugPrint(
+          '[WorkshopService] downloadZip HTTP ${resp.statusCode} '
+          'url=$finalUrl useAuth=$useAuth',
+        );
+        return null;
+      }
 
       // 先写入 .part 临时文件，下载完整后再改名发布
       final tmp = File('${workshopDir.path}/$name.part');

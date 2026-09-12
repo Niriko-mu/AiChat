@@ -140,8 +140,9 @@ Map<String, String> _signTencentCos({
   // SignKey = hex(HMAC-SHA1(SecretKey, KeyTime))
   final signKeyHex = _hex(_hmacSha1(utf8.encode(secretKey), keyTime));
 
-  // UriPathname：与实际请求 path 一致；简单 ASCII 路径可直接用
-  final pathname = uri.path.isEmpty ? '/' : uri.path;
+  // UriPathname：与实际 HTTP 请求中的 path 一致（已编码）。
+  // Dart Uri.path 会解码，中文/特殊字符需按 segment 再 encode，否则 GET 对象 403。
+  final pathname = _encodePathForSign(uri);
 
   // UrlParamList / HttpParameters：key 小写并 UrlEncode，value UrlEncode，再按字典序排序
   final params = uri.queryParameters;
@@ -177,6 +178,16 @@ Map<String, String> _signTencentCos({
   return {
     'Authorization': authorization,
   };
+}
+
+/// 把 Dart 解码后的 path 重新按 segment 编码，对齐实际请求行。
+String _encodePathForSign(Uri uri) {
+  final raw = uri.path;
+  if (raw.isEmpty) return '/';
+  return raw
+      .split('/')
+      .map((s) => s.isEmpty ? '' : Uri.encodeComponent(s))
+      .join('/');
 }
 
 String _hex(List<int> bytes) =>
