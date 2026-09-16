@@ -566,16 +566,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   /// AI 消息上方的思考时长小字（与时间标签同风格，不入正文）
+  /// 仅挂在角色消息上，左对齐到对方气泡一侧
   Widget _buildThinkingDurationLabel(Message msg) {
+    if (msg.isFromUser) return const SizedBox.shrink();
     final duration = msg.reasoningDurationMs;
     if (duration == null) return const SizedBox.shrink();
     return Consumer<ChatSettingsProvider>(
       builder: (context, settings, _) {
         if (!settings.showThinkingDuration) return const SizedBox.shrink();
         return Padding(
-          padding: const EdgeInsets.only(bottom: 4, right: 48),
+          padding: const EdgeInsets.only(bottom: 4, left: 48),
           child: Row(
-            mainAxisAlignment: MainAxisAlignment.end,
+            mainAxisAlignment: MainAxisAlignment.start,
             children: [
               Container(
                 padding:
