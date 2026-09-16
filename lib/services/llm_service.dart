@@ -10,8 +10,9 @@ import '../providers/api_provider.dart';
 /// 兼容说明（OpenAI 兼容网关上常见）：
 /// - 默认：不附加任何字段，用模型/网关默认（兼容性最好）
 /// - 关闭：`enable_thinking: false`（Qwen / 混元 / 部分兼容层）
-/// - 低/高：`reasoning_effort`（OpenAI / DeepSeek / Kimi / GLM 等）+ `enable_thinking: true`
-enum ModelThinkingLevel { off, low, defaultLevel, high }
+/// - 低/高/极高：`reasoning_effort`（OpenAI / DeepSeek / Kimi / GLM 等）+ `enable_thinking: true`
+///   「极高」对应 `xhigh`（部分模型写为 max / ultrahigh，不支持时网关可能忽略或报错）
+enum ModelThinkingLevel { off, low, defaultLevel, high, xhigh }
 
 extension ModelThinkingLevelX on ModelThinkingLevel {
   String get displayName => switch (this) {
@@ -19,6 +20,7 @@ extension ModelThinkingLevelX on ModelThinkingLevel {
         ModelThinkingLevel.low => '低',
         ModelThinkingLevel.defaultLevel => '默认',
         ModelThinkingLevel.high => '高',
+        ModelThinkingLevel.xhigh => '极高',
       };
 
   String get description => switch (this) {
@@ -26,6 +28,7 @@ extension ModelThinkingLevelX on ModelThinkingLevel {
         ModelThinkingLevel.low => '少量思考，适合日常闲聊',
         ModelThinkingLevel.defaultLevel => '使用模型默认思考设置（推荐）',
         ModelThinkingLevel.high => '更深入思考，可能更慢、更耗 token',
+        ModelThinkingLevel.xhigh => '极限思考（xhigh），最慢、最耗 token，部分模型不支持',
       };
 }
 
@@ -63,6 +66,12 @@ class LLMService {
         return const {
           'enable_thinking': true,
           'reasoning_effort': 'high',
+        };
+      case ModelThinkingLevel.xhigh:
+        // 部分模型/网关识别 xhigh；不支持时可能忽略或 400，可改回「默认」
+        return const {
+          'enable_thinking': true,
+          'reasoning_effort': 'xhigh',
         };
     }
   }
@@ -1122,7 +1131,29 @@ class LLMService {
       promptTokens: _usageInt(usage['prompt_tokens']),
       completionTokens: _usageInt(usage['completion_tokens']),
       totalTokens: _usageInt(usage['total_tokens']),
+      reasoningTokens: parseReasoningTokens(usage),
     );
+  }
+
+  /// 从 usage 中解析思考 token（OpenAI: completion_tokens_details.reasoning_tokens）。
+  /// 字段缺失或无法解析时返回 null，由调用方按正文估算。
+  static int? parseReasoningTokens(Map<String, dynamic> usage) {
+    final details = usage['completion_tokens_details'];
+    if (details is Map<String, dynamic>) {
+      return _usageInt(details['reasoning_tokens']);
+    }
+    return null;
+  }
+
+  /// 估算思考 token（网关未返回 reasoning_tokens 时使用）。
+  static int estimateReasoningTokens(String reasoning) {
+    if (reasoning.trim().isEmpty) return 0;
+    // 与 ChatProvider 文本估算同口径：英文词 ≈ token，中文按字
+    final en = RegExp(r'[A-Za-z0-9]+').allMatches(reasoning).length;
+    final cjk = reasoning.runes.where((r) {
+      return (r >= 0x2E80 && r <= 0x9FFF) || (r >= 0xF900 && r <= 0xFAFF);
+    }).length;
+    return en + cjk;
   }
 
   static int? _usageInt(dynamic v) {
@@ -1274,14 +1305,22 @@ class ChatUsage {
   final int? completionTokens; // 输出：AI 思考过程 + 最终回复
   final int? totalTokens; // prompt + completion
 
+  /// 思考过程 token（通常已含在 completionTokens 内）。
+  /// 优先取 API 的 completion_tokens_details.reasoning_tokens。
+  final int? reasoningTokens;
+
   const ChatUsage({
     this.promptTokens,
     this.completionTokens,
     this.totalTokens,
+    this.reasoningTokens,
   });
 
   bool get isEmpty =>
-      promptTokens == null && completionTokens == null && totalTokens == null;
+      promptTokens == null &&
+      completionTokens == null &&
+      totalTokens == null &&
+      reasoningTokens == null;
 }
 
 /// 对话补全结果：回复内容 + 真实 token 用量 + 思考过程

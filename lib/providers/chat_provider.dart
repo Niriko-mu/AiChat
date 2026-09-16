@@ -552,14 +552,18 @@ class ChatProvider extends ChangeNotifier {
                     sum + _estimateTextTokens(item['content'] ?? '') +
                         kPerMessageJsonTokens,
               );
+      // completion 已含思考；网关未给 reasoning_tokens 时按思考正文估算
+      final reasoningTokens = streamUsage.reasoningTokens ??
+          LLMService.estimateReasoningTokens(reasoning);
       final completionTokens = streamUsage.completionTokens ??
-          _estimateTextTokens(content);
+          _estimateTextTokens(content) + reasoningTokens;
       await TokenUsageProvider.instance.addUsage(
         conversationId,
         ChatUsage(
           promptTokens: promptTokens,
           completionTokens: completionTokens,
           totalTokens: promptTokens + completionTokens,
+          reasoningTokens: reasoningTokens,
         ),
       );
       // 进度条显示下一次请求可能携带的上下文，必须与 contextCount 和
@@ -807,8 +811,19 @@ class ChatProvider extends ChangeNotifier {
         extraSystemContext: extraSystemContext,
       );
       final messages = result.messages;
-      // 累计真实 token 用量（发送 = prompt_tokens，接收 = completion_tokens）
-      await TokenUsageProvider.instance.addUsage(conversationId, result.usage);
+      // 累计真实 token 用量（发送 = prompt_tokens，接收 = completion_tokens，含思考）
+      var usage = result.usage;
+      if (usage.reasoningTokens == null &&
+          result.reasoningContent.trim().isNotEmpty) {
+        usage = ChatUsage(
+          promptTokens: usage.promptTokens,
+          completionTokens: usage.completionTokens,
+          totalTokens: usage.totalTokens,
+          reasoningTokens:
+              LLMService.estimateReasoningTokens(result.reasoningContent),
+        );
+      }
+      await TokenUsageProvider.instance.addUsage(conversationId, usage);
       final random = Random();
       final displayedMessages = <String>[];
       var stickerSent = false;

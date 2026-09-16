@@ -565,8 +565,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     return s >= 10 ? '${s.toStringAsFixed(0)}s' : '${s.toStringAsFixed(1)}s';
   }
 
-  /// AI 消息上方的思考时长小字（与时间标签同风格，不入正文）
-  /// 仅挂在角色消息上，左对齐到对方气泡一侧
+  /// 角色气泡下方的思考时长（与时间标签同风格，不入正文）
+  /// 左对齐到气泡列（避开头像），不显示在用户消息上
   Widget _buildThinkingDurationLabel(Message msg) {
     if (msg.isFromUser) return const SizedBox.shrink();
     final duration = msg.reasoningDurationMs;
@@ -575,7 +575,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       builder: (context, settings, _) {
         if (!settings.showThinkingDuration) return const SizedBox.shrink();
         return Padding(
-          padding: const EdgeInsets.only(bottom: 4, left: 48),
+          // 与 ChatBubble 行内对齐：页边 12 + 头像 40 + 间距 8
+          padding: const EdgeInsets.only(top: 0, bottom: 6, left: 60, right: 48),
           child: Row(
             mainAxisAlignment: MainAxisAlignment.start,
             children: [
@@ -2057,8 +2058,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                   children: [
                                     if (showTime)
                                       _buildTimeLabel(msg.createdAt),
-                                    if (!msg.isFromUser)
-                                      _buildThinkingDurationLabel(msg),
                                     ChatBubble(
                                       message: msg,
                                       userAvatar: userAvatar,
@@ -2084,6 +2083,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                       onLongPress: (message, bubbleKey) =>
                                           _showBubbleMenu(message, bubbleKey),
                                     ),
+                                    // 思考时长：角色气泡下方，左对齐气泡列
+                                    if (!msg.isFromUser)
+                                      _buildThinkingDurationLabel(msg),
                                   ],
                                 ),
                               );

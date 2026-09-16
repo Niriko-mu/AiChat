@@ -70,6 +70,11 @@ class _TokenUsageScreenState extends State<TokenUsageScreen> {
               Container(height: 0.5, color: context.separatorColor),
               _SummaryRow(label: '累计输出 tokens', value: usage.receivedTotal),
               Container(height: 0.5, color: context.separatorColor),
+              _SummaryRow(
+                label: '其中思考 tokens',
+                value: usage.reasoningTotal,
+              ),
+              Container(height: 0.5, color: context.separatorColor),
               _SummaryRow(label: '累计消耗', value: usage.total, highlight: true),
               Container(height: 0.5, color: context.separatorColor),
               _SummaryRow(
@@ -81,8 +86,9 @@ class _TokenUsageScreenState extends State<TokenUsageScreen> {
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
             child: Text(
-              '累计输入 = Σ 每轮实际发送给 API 的 prompt_tokens（已含系统提示词与多轮历史上下文回传）；'
-              '累计输出 = Σ 每轮 API 返回的 completion_tokens',
+              '累计输入 = Σ prompt_tokens；'
+              '累计输出 = Σ completion_tokens（已含思考，对齐账单）；'
+              '其中思考优先取 API reasoning_tokens，否则按思考正文估算，不重复计入总额。',
               textAlign: TextAlign.center,
               style: TextStyle(
                 fontSize: 11,
@@ -332,7 +338,12 @@ class _UsageTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final sub = subtitle ??
-        '输入 ${_fmtTokens(usage.sentTokens)} · 输出 ${_fmtTokens(usage.receivedTokens)}';
+        (usage.reasoningTokens > 0
+            ? '输入 ${_fmtTokens(usage.sentTokens)} · '
+                '输出 ${_fmtTokens(usage.receivedTokens)}'
+                '（思考 ${_fmtTokens(usage.reasoningTokens)}）'
+            : '输入 ${_fmtTokens(usage.sentTokens)} · '
+                '输出 ${_fmtTokens(usage.receivedTokens)}');
     return CupertinoListTile(
       leading: leadingIcon != null
           ? Container(
