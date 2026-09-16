@@ -5,6 +5,30 @@ import 'package:flutter/foundation.dart';
 import '../models/sticker_pack.dart';
 import '../providers/api_provider.dart';
 
+/// 模型思考强度：映射到 reasoning_effort / enable_thinking（视模型支持情况）。
+///
+/// 兼容说明（OpenAI 兼容网关上常见）：
+/// - 默认：不附加任何字段，用模型/网关默认（兼容性最好）
+/// - 关闭：`enable_thinking: false`（Qwen / 混元 / 部分兼容层）
+/// - 低/高：`reasoning_effort`（OpenAI / DeepSeek / Kimi / GLM 等）+ `enable_thinking: true`
+enum ModelThinkingLevel { off, low, defaultLevel, high }
+
+extension ModelThinkingLevelX on ModelThinkingLevel {
+  String get displayName => switch (this) {
+        ModelThinkingLevel.off => '关闭',
+        ModelThinkingLevel.low => '低',
+        ModelThinkingLevel.defaultLevel => '默认',
+        ModelThinkingLevel.high => '高',
+      };
+
+  String get description => switch (this) {
+        ModelThinkingLevel.off => '关闭深度思考，回复更快',
+        ModelThinkingLevel.low => '少量思考，适合日常闲聊',
+        ModelThinkingLevel.defaultLevel => '使用模型默认思考设置（推荐）',
+        ModelThinkingLevel.high => '更深入思考，可能更慢、更耗 token',
+      };
+}
+
 /// 主动消息系统 - LLM 服务层
 ///
 /// 封装 API 调用与响应容错解析：
@@ -14,6 +38,34 @@ import '../providers/api_provider.dart';
 class LLMService {
   static const String defaultBaseUrl = 'https://api.deepseek.com';
   static const List<String> _fallbackMessages = ['（网络开小差了，等下再聊）'];
+
+  /// 当前思考强度（由聊天设置同步）；写入请求体的兼容字段。
+  static ModelThinkingLevel thinkingLevel = ModelThinkingLevel.defaultLevel;
+
+  /// 按思考强度生成请求体附加字段。
+  ///
+  /// 尽量兼容 MiMo / Qwen / DeepSeek / Grok / Gemini / GPT / GLM / Kimi / 混元
+  /// 等 OpenAI 兼容网关：默认不附加；显式档位时同时带
+  /// `reasoning_effort`（OpenAI 系）与 `enable_thinking`（Qwen/混元系），
+  /// 不认识的字段通常会被忽略。
+  static Map<String, Object> thinkingRequestFields() {
+    switch (thinkingLevel) {
+      case ModelThinkingLevel.off:
+        return const {'enable_thinking': false};
+      case ModelThinkingLevel.low:
+        return const {
+          'enable_thinking': true,
+          'reasoning_effort': 'low',
+        };
+      case ModelThinkingLevel.defaultLevel:
+        return const {};
+      case ModelThinkingLevel.high:
+        return const {
+          'enable_thinking': true,
+          'reasoning_effort': 'high',
+        };
+    }
+  }
 
   /// 会话压缩的 System Prompt：将较早的聊天记录压缩为一段摘要
   static const String kCompressSystemPrompt =
@@ -113,7 +165,12 @@ class LLMService {
     final result =
         roleplayMode ? parseRoleplayMessage(raw) : parseMessages(raw);
     debugPrint('[LLMService] 解析结果(${result.length}条): $result');
-    return ProactiveResult(result, completion.usage);
+    return ProactiveResult(
+      result,
+      completion.usage,
+      reasoningContent: completion.reasoningContent,
+      reasoningDurationMs: completion.reasoningDurationMs,
+    );
   }
 
   /// 为语C正文回复提供 4 个可继续推进剧情的候选行动。
@@ -189,7 +246,12 @@ class LLMService {
     final result =
         roleplayMode ? parseRoleplayMessage(raw) : parseMessages(raw);
     debugPrint('[LLMService] 解析结果(${result.length}条): $result');
-    return ProactiveResult(result, completion.usage);
+    return ProactiveResult(
+      result,
+      completion.usage,
+      reasoningContent: completion.reasoningContent,
+      reasoningDurationMs: completion.reasoningDurationMs,
+    );
   }
 
   /// 按文件扩展名推断图片 MIME（OpenAI 视觉格式要求 data URL 带类型）
@@ -242,6 +304,7 @@ class LLMService {
         'stream_options': {'include_usage': true},
         'max_tokens': maxTokens,
         'temperature': temperature,
+        ...thinkingRequestFields(),
       })));
       final response =
           await request.close().timeout(const Duration(seconds: 60));
@@ -256,7 +319,9 @@ class LLMService {
         final data = line.substring(5).trim();
         if (data == '[DONE]') break;
         final chunk = parseStreamChunk(data);
-        if (chunk.content.isNotEmpty || !chunk.usage.isEmpty) yield chunk;
+        if (chunk.content.isNotEmpty || chunk.reasoning.isNotEmpty || !chunk.usage.isEmpty) {
+        yield chunk;
+      }
       }
     } finally {
       client.close(force: true);
@@ -273,13 +338,29 @@ class LLMService {
           ? null
           : (choices.first as Map<String, dynamic>)['delta']
               as Map<String, dynamic>?;
+      final reasoning = _extractReasoning(delta) ??
+          _extractReasoning(choices.isEmpty
+              ? null
+              : (choices.first as Map<String, dynamic>)['message']
+                  as Map<String, dynamic>?) ??
+          _extractReasoning(decoded) ??
+          '';
       return StreamCompletionChunk(
         content: delta?['content'] as String? ?? '',
         usage: _parseUsage(decoded),
+        reasoning: reasoning,
       );
     } catch (_) {
       return const StreamCompletionChunk();
     }
+  }
+
+  /// 从 message/delta 中提取思考过程（DeepSeek reasoning_content，部分网关 reasoning）。
+  static String? _extractReasoning(Map<String, dynamic>? map) {
+    if (map == null) return null;
+    final v = map['reasoning_content'] ?? map['reasoning'];
+    if (v is String) return v;
+    return null;
   }
 
   /// 失败抛出 [LLMException]。
@@ -338,6 +419,7 @@ class LLMService {
     required bool jsonMode,
   }) async {
     final client = HttpClient();
+    final stopwatch = Stopwatch()..start();
     try {
       final request = await client
           .postUrl(Uri.parse(url))
@@ -354,6 +436,7 @@ class LLMService {
         'max_tokens': maxTokens,
         if (temperature != null) 'temperature': temperature,
         if (jsonMode) 'response_format': {'type': 'json_object'},
+        ...thinkingRequestFields(),
       })));
 
       final response =
@@ -364,6 +447,7 @@ class LLMService {
           .transform(utf8.decoder)
           .join()
           .timeout(const Duration(seconds: 60));
+      stopwatch.stop();
 
       if (response.statusCode == 200) {
         final decoded = jsonDecode(body) as Map<String, dynamic>;
@@ -373,9 +457,16 @@ class LLMService {
         }
         final message = (choices.first as Map<String, dynamic>)['message']
             as Map<String, dynamic>?;
+        final reasoning = _extractReasoning(message) ?? '';
+        final content = message?['content'] as String? ?? '';
+        // 无思考内容时不记录时长，避免把纯正文耗时误标成思考
+        final durationMs =
+            reasoning.trim().isEmpty ? null : stopwatch.elapsedMilliseconds;
         return CompletionResult(
-          message?['content'] as String? ?? '',
+          content,
           _parseUsage(decoded),
+          reasoningContent: reasoning,
+          reasoningDurationMs: durationMs,
         );
       }
 
@@ -389,6 +480,7 @@ class LLMService {
       } catch (_) {}
       throw LLMException('API 请求失败：$errorMessage');
     } finally {
+      stopwatch.stop();
       client.close(force: true);
     }
   }
@@ -1164,10 +1256,16 @@ class StreamCompletionChunk {
   final String content;
   final ChatUsage usage;
 
+  /// 思考过程增量（reasoning_content / reasoning）
+  final String reasoning;
+
   const StreamCompletionChunk({
     this.content = '',
     this.usage = const ChatUsage(),
+    this.reasoning = '',
   });
+
+  bool get isEmpty => content.isEmpty && reasoning.isEmpty && usage.isEmpty;
 }
 
 /// 一次对话补全的 token 用量（来自 API 响应 usage 字段；字段缺失为 null）
@@ -1186,16 +1284,36 @@ class ChatUsage {
       promptTokens == null && completionTokens == null && totalTokens == null;
 }
 
-/// 对话补全结果：回复内容 + 真实 token 用量
+/// 对话补全结果：回复内容 + 真实 token 用量 + 思考过程
 class CompletionResult {
   final String content;
   final ChatUsage usage;
-  const CompletionResult(this.content, this.usage);
+
+  /// 思考过程原文（可能为空）
+  final String reasoningContent;
+
+  /// 思考耗时（毫秒），无思考时为 null
+  final int? reasoningDurationMs;
+
+  const CompletionResult(
+    this.content,
+    this.usage, {
+    this.reasoningContent = '',
+    this.reasoningDurationMs,
+  });
 }
 
-/// 角色回复结果：解析出的消息列表 + 本次请求的 token 用量
+/// 角色回复结果：解析出的消息列表 + 本次请求的 token 用量 + 思考过程
 class ProactiveResult {
   final List<String> messages;
   final ChatUsage usage;
-  const ProactiveResult(this.messages, this.usage);
+  final String reasoningContent;
+  final int? reasoningDurationMs;
+
+  const ProactiveResult(
+    this.messages,
+    this.usage, {
+    this.reasoningContent = '',
+    this.reasoningDurationMs,
+  });
 }

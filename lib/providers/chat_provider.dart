@@ -501,7 +501,9 @@ class ChatProvider extends ChangeNotifier {
     _messagesMap[conversationId]!.add(message);
     notifyListeners();
     var content = '';
+    var reasoning = '';
     ChatUsage streamUsage = const ChatUsage();
+    final streamWatch = Stopwatch()..start();
     try {
       await for (final chunk in LLMService.streamCompletion(
         model: model,
@@ -512,15 +514,19 @@ class ChatProvider extends ChangeNotifier {
         ],
       )) {
         content += chunk.content;
+        reasoning += chunk.reasoning;
         if (!chunk.usage.isEmpty) streamUsage = chunk.usage;
         final index = _messagesMap[conversationId]!
             .indexWhere((item) => item.id == message.id);
         if (index >= 0) {
-          _messagesMap[conversationId]![index] =
-              message.copyWith(content: content);
+          _messagesMap[conversationId]![index] = message.copyWith(
+            content: content,
+            reasoningContent: reasoning,
+          );
           notifyListeners();
         }
       }
+      streamWatch.stop();
       final reply = LLMService.parseRoleplayReply(content);
       content = reply.content;
       if (reply.choices.isNotEmpty) {
@@ -529,8 +535,13 @@ class ChatProvider extends ChangeNotifier {
       final index = _messagesMap[conversationId]!
           .indexWhere((item) => item.id == message.id);
       if (index >= 0) {
-        _messagesMap[conversationId]![index] =
-            message.copyWith(content: content);
+        _messagesMap[conversationId]![index] = message.copyWith(
+          content: content,
+          reasoningContent: reasoning,
+          reasoningDurationMs:
+              reasoning.trim().isEmpty ? null : streamWatch.elapsedMilliseconds,
+        );
+        _persist();
       }
       _updateConversationLastMessage(conversationId, content);
       final promptTokens = streamUsage.promptTokens ??
@@ -801,6 +812,7 @@ class ChatProvider extends ChangeNotifier {
       final random = Random();
       final displayedMessages = <String>[];
       var stickerSent = false;
+      var reasoningAttached = false;
       for (final content in messages) {
         final query = StickerQueryProtocol.extractQuery(content);
         final visibleContent = StickerQueryProtocol.visibleText(content);
@@ -824,7 +836,17 @@ class ChatProvider extends ChangeNotifier {
           if (visibleContent.isEmpty) continue;
         }
         if (visibleContent.isEmpty) continue;
-        addProactiveMessage(conversationId, visibleContent);
+        addProactiveMessage(
+          conversationId,
+          visibleContent,
+          reasoningContent: reasoningAttached
+              ? ''
+              : result.reasoningContent,
+          reasoningDurationMs: reasoningAttached
+              ? null
+              : result.reasoningDurationMs,
+        );
+        if (result.reasoningContent.trim().isNotEmpty) reasoningAttached = true;
         displayedMessages.add(visibleContent);
         HapticFeedback.lightImpact(); // 消息提示震动
         // 延迟 = 随机 0~1s + 消息长度 * 50ms（模拟打字耗时）+ 600ms 消息间隔
@@ -1141,8 +1163,14 @@ class ChatProvider extends ChangeNotifier {
     }
   }
 
-  /// 将一条角色主动消息加入会话并持久化（渲染阶段逐条调用）
-  void addProactiveMessage(String conversationId, String content) {
+  /// 将一条角色主动消息加入会话并持久化（渲染阶段逐条调用）。
+  /// [reasoningContent] / [reasoningDurationMs] 仅挂在第一条文本消息上。
+  void addProactiveMessage(
+    String conversationId,
+    String content, {
+    String reasoningContent = '',
+    int? reasoningDurationMs,
+  }) {
     if (content.trim().isEmpty) return;
     debugPrint('[ChatProvider] addProactiveMessage 入库: $conversationId');
     _messagesMap[conversationId] ??= [];
@@ -1151,6 +1179,8 @@ class ChatProvider extends ChangeNotifier {
       conversationId: conversationId,
       content: content,
       sender: MessageSender.character,
+      reasoningContent: reasoningContent,
+      reasoningDurationMs: reasoningDurationMs,
     ));
     _updateConversationLastMessage(conversationId, content);
     _notifyCharacterMessage(conversationId, content);

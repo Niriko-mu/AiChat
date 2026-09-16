@@ -302,10 +302,35 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return;
     }
 
+    final includeReasoning = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: const Text('导出聊天记录'),
+        content: const Text('是否将 AI 思考过程一并写入导出文件？'),
+        actions: [
+          CupertinoDialogAction(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('取消'),
+          ),
+          CupertinoDialogAction(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('不含思考'),
+          ),
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('包含思考'),
+          ),
+        ],
+      ),
+    );
+    if (includeReasoning == null || !mounted) return;
+
     try {
       final bytes = await ChatRecordsService.buildExportZip(
         characterName: widget.characterName,
         messages: messages,
+        includeReasoning: includeReasoning,
       );
       if (!mounted) return;
 
@@ -480,6 +505,100 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _menuOverlay = null;
   }
 
+  /// 查看 AI 思考过程（仅本地展示，不回传）
+  void _showReasoningContent(Message message) {
+    final text = message.reasoningContent.trim();
+    if (text.isEmpty) return;
+    final duration = message.reasoningDurationMs;
+    showCupertinoDialog(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: const Text('AI 思考过程'),
+        content: ConstrainedBox(
+          constraints: BoxConstraints(
+            maxHeight: MediaQuery.of(ctx).size.height * 0.55,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                if (duration != null)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Text(
+                      '思考耗时 ${_formatThinkingDuration(duration)}',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: ctx.textSecondaryColor,
+                      ),
+                    ),
+                  ),
+                Text(
+                  text,
+                  textAlign: TextAlign.start,
+                  style: TextStyle(
+                    fontSize: 13,
+                    height: 1.4,
+                    color: ctx.textPrimaryColor,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('关闭'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatThinkingDuration(int ms) {
+    if (ms < 1000) return '${ms}ms';
+    final s = ms / 1000;
+    return s >= 10 ? '${s.toStringAsFixed(0)}s' : '${s.toStringAsFixed(1)}s';
+  }
+
+  /// AI 消息上方的思考时长小字（与时间标签同风格，不入正文）
+  Widget _buildThinkingDurationLabel(Message msg) {
+    final duration = msg.reasoningDurationMs;
+    if (duration == null) return const SizedBox.shrink();
+    return Consumer<ChatSettingsProvider>(
+      builder: (context, settings, _) {
+        if (!settings.showThinkingDuration) return const SizedBox.shrink();
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 4, right: 48),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: context.textSecondaryColor.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  '思考 ${_formatThinkingDuration(duration)}',
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: context.textSecondaryColor,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   /// 构建菜单项列表
   List<Widget> _buildMenuItems(Message message) {
     final isUser = message.isFromUser;
@@ -536,6 +655,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         );
       }
     } else {
+      if (message.hasReasoning) {
+        items.add(
+          _menuItem(
+            icon: CupertinoIcons.lightbulb,
+            label: '查看思考',
+            onTap: () {
+              _closeMenu();
+              _showReasoningContent(message);
+            },
+          ),
+        );
+      }
       items.add(
         _menuItem(
           icon: CupertinoIcons.pencil,
@@ -1924,6 +2055,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                                   children: [
                                     if (showTime)
                                       _buildTimeLabel(msg.createdAt),
+                                    if (!msg.isFromUser)
+                                      _buildThinkingDurationLabel(msg),
                                     ChatBubble(
                                       message: msg,
                                       userAvatar: userAvatar,
