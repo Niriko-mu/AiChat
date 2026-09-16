@@ -33,9 +33,17 @@ class WorkshopService {
   static const String kCosNoteFolder = 'Note';
 
   /// ListObjects 结果内存缓存（短 TTL，避免同一会话内重复全量列举）
-  static final Map<String, ({DateTime at, List<({String key, int size})> objects})>
-      _cosListCache = {};
-  static const Duration _cosListCacheTtl = Duration(minutes: 5);
+  static final Map<
+      String,
+      ({
+        DateTime at,
+        List<({String key, int size})> objects,
+        bool complete,
+      })> _cosListCache = {};
+  static const Duration _cosListCacheTtl = Duration(minutes: 30);
+
+  /// 首屏列表页大小（角色很多时只先拉一页）
+  static const int kCosFirstPageSize = 500;
 
   /// 清除 COS 列表缓存（仓库刷新时调用）
   static void invalidateCosListCache([String? baseUrl]) {
@@ -46,6 +54,12 @@ class WorkshopService {
     final key = _cosListCacheKey(baseUrl, null);
     _cosListCache.remove(key);
     _cosListCache.removeWhere((k, _) => k.startsWith('$key|'));
+  }
+
+  /// 该 BASE_URL 当前缓存（或最近一次 List）是否已取完全部对象。
+  static bool cosListIsComplete(String baseUrl, {CosAuth? auth}) {
+    final hit = _cosListCache[_cosListCacheKey(baseUrl, auth)];
+    return hit?.complete ?? true;
   }
 
   static String _cosListCacheKey(String baseUrl, CosAuth? auth) {
@@ -138,42 +152,90 @@ class WorkshopService {
     return '';
   }
 
-  /// S3 ListObjects V2：GET {桶根}/?list-type=2&prefix={BASE路径}/&max-keys=1000
+  /// S3 ListObjects V2。
   ///
-  /// 结果默认缓存约 5 分钟，供目录探测 / 资产列表 / 更新通知共用。
-  /// [force] 为 true 时跳过缓存（用户手动刷新）。
+  /// [firstPageOnly] 为 true 时只取首页约 [kCosFirstPageSize] 条（打开分类用）；
+  /// 为 false 时跟随 continuation-token 拉到取完或 [maxPages] 页（搜索/加载更多）。
+  /// 完整列表优先复用缓存；首页缓存若已 complete 也会直接当全量返回。
+  /// [force] 跳过缓存（用户手动刷新）。
   static Future<List<({String key, int size})>> listCosObjects(
     String baseUrl, {
     CosAuth? auth,
     bool force = false,
+    bool firstPageOnly = false,
+    int maxPages = 10,
   }) async {
     final cacheKey = _cosListCacheKey(baseUrl, auth);
     if (!force) {
       final hit = _cosListCache[cacheKey];
       if (hit != null &&
           DateTime.now().difference(hit.at) < _cosListCacheTtl) {
-        return hit.objects;
+        // 全量请求：仅当缓存已完整时才可直接返回
+        if (firstPageOnly || hit.complete) return hit.objects;
       }
     }
 
     final parsed = parseCosBaseUrl(baseUrl);
     final prefix = parsed.prefix.isEmpty ? '' : '${parsed.prefix}/';
-    // 空 prefix 不可写入 queryParameters：Dart 会拼成 `prefix`（无 =），COS 返回 400
-    final listUri = parsed.bucketRoot.replace(
-      path: '/',
-      queryParameters: {
-        'list-type': '2',
-        if (prefix.isNotEmpty) 'prefix': prefix,
-        'max-keys': '1000',
-      },
-    );
-    final resp = await http
-        .get(listUri, headers: _cosHeaders(listUri, auth))
-        .timeout(const Duration(seconds: 20));
-    if (resp.statusCode != 200) {
-      _throwCosStatus(resp.statusCode, utf8.decode(resp.bodyBytes, allowMalformed: true), auth: auth);
+    final pageSize = firstPageOnly ? kCosFirstPageSize : 1000;
+    final pages = firstPageOnly ? 1 : maxPages;
+    final result = <({String key, int size})>[];
+    String? continuationToken;
+    var truncated = false;
+
+    for (var page = 0; page < pages; page++) {
+      // 空 prefix / token 不可写入 queryParameters：Dart 会拼成 `prefix`（无 =），COS 返回 400
+      final listUri = parsed.bucketRoot.replace(
+        path: '/',
+        queryParameters: {
+          'list-type': '2',
+          if (prefix.isNotEmpty) 'prefix': prefix,
+          'max-keys': '$pageSize',
+          if (continuationToken != null && continuationToken.isNotEmpty)
+            'continuation-token': continuationToken,
+        },
+      );
+      final resp = await http
+          .get(listUri, headers: _cosHeaders(listUri, auth))
+          .timeout(const Duration(seconds: 20));
+      if (resp.statusCode != 200) {
+        _throwCosStatus(
+          resp.statusCode,
+          utf8.decode(resp.bodyBytes, allowMalformed: true),
+          auth: auth,
+        );
+      }
+      final doc = XmlDocument.parse(utf8.decode(resp.bodyBytes));
+      result.addAll(_parseListBucketContents(doc));
+
+      truncated = doc.descendantElements
+          .any((e) => e.name.local == 'IsTruncated' && e.innerText.trim() == 'true');
+      String? next;
+      for (final e in doc.descendantElements) {
+        if (e.name.local == 'NextContinuationToken') {
+          next = e.innerText.trim();
+          break;
+        }
+      }
+      if (!truncated || next == null || next.isEmpty) {
+        truncated = false;
+        break;
+      }
+      continuationToken = next;
     }
-    final doc = XmlDocument.parse(utf8.decode(resp.bodyBytes));
+
+    // 首页模式：若未截断则已完整；全量模式在 maxPages 打满且仍截断时视为不完整
+    final complete = !truncated;
+    _cosListCache[cacheKey] = (
+      at: DateTime.now(),
+      objects: result,
+      complete: complete,
+    );
+    return result;
+  }
+
+  static List<({String key, int size})> _parseListBucketContents(
+      XmlDocument doc) {
     final result = <({String key, int size})>[];
     // 按 local name 匹配，兼容带默认命名空间或前缀的 S3/COS 响应
     for (final content in doc.descendantElements) {
@@ -190,7 +252,6 @@ class WorkshopService {
       if (key == null || key.isEmpty) continue;
       result.add((key: key, size: size));
     }
-    _cosListCache[cacheKey] = (at: DateTime.now(), objects: result);
     return result;
   }
 
@@ -201,7 +262,13 @@ class WorkshopService {
     bool force = false,
   }) async {
     try {
-      final objects = await listCosObjects(baseUrl, auth: auth, force: force);
+      // 目录探测用首页即可：只需知道各分类是否有文件
+      final objects = await listCosObjects(
+        baseUrl,
+        auth: auth,
+        force: force,
+        firstPageOnly: true,
+      );
       final basePrefix = _cosBasePrefix(baseUrl);
 
       bool hasZip(String folder) =>
@@ -245,10 +312,12 @@ class WorkshopService {
   }
 
   /// 列出 COS 某分类下的 zip 资产（downloadUrl = BASE_URL + 编码后的相对 Key）。
+  /// [loadAll] 为 false 时仅用首页（约 500 条）过滤；为 true 时拉全量。
   static Future<List<WorkshopAsset>> listCosAssets(
     String baseUrl,
     String tag, {
     CosAuth? auth,
+    bool loadAll = false,
   }) async {
     if (!kWorkshopPackTags.contains(tag)) return const [];
     final folder = switch (tag) {
@@ -259,7 +328,11 @@ class WorkshopService {
     };
     if (folder == null) return const [];
 
-    final objects = await listCosObjects(baseUrl, auth: auth);
+    final objects = await listCosObjects(
+      baseUrl,
+      auth: auth,
+      firstPageOnly: !loadAll,
+    );
     final basePrefix = _cosBasePrefix(baseUrl);
     final folderPrefix = '$basePrefix$folder/';
     final assets = <WorkshopAsset>[];
@@ -299,13 +372,26 @@ class WorkshopService {
     return null;
   }
 
+  /// 归一化 Note 正文，避免换行/BOM 差异导致「内容未变却反复提醒」。
+  static String normalizeCosNote(String body) {
+    var s = body;
+    if (s.startsWith('﻿')) s = s.substring(1);
+    return s.replaceAll('\r\n', '\n').replaceAll('\r', '\n').trim();
+  }
+
   /// 拉取 COS Note 目录更新通知 Markdown 全文。
-  /// 优先级：`update.md` → `note.md` → `readme.md` → 目录中最后一个 `.md`。
-  /// ListObjects 失败时（且未配置密钥）回退为按固定文件名探测。
+  ///
+  /// 优先按固定文件名探测（update.md → note.md → readme.md），结果稳定；
+  /// 都没有时再 List 目录取最后一个 `.md`（按 Key 排序，避免列举顺序抖动）。
   static Future<String?> fetchCosNote(
     String baseUrl, {
     CosAuth? auth,
   }) async {
+    // 1) 固定文件名探测（私有读也走签名 GET，结果稳定）
+    final probed = await probeCosNote(baseUrl, auth: auth);
+    if (probed != null) return normalizeCosNote(probed);
+
+    // 2) List 目录找其它 .md
     try {
       final objects = await listCosObjects(baseUrl, auth: auth);
       final basePrefix = _cosBasePrefix(baseUrl);
@@ -317,34 +403,14 @@ class WorkshopService {
               o.key.toLowerCase().endsWith('.md') &&
               !o.key.substring(notePrefix.length).contains('/'))
           .map((o) => o.key)
-          .toList(growable: false);
+          .toList()
+        ..sort();
       if (mdKeys.isEmpty) return null;
 
-      String? pick;
-      for (final preferred in const ['update.md', 'note.md', 'readme.md']) {
-        for (final k in mdKeys) {
-          if (k.substring(notePrefix.length).toLowerCase() == preferred) {
-            pick = k;
-            break;
-          }
-        }
-        if (pick != null) break;
-      }
-      pick ??= mdKeys.last;
-
-      return _getCosText(baseUrl, pick, auth: auth);
-    } on HttpException catch (e) {
-      if ((auth?.isConfigured ?? false) || !e.message.contains('403')) {
-        rethrow;
-      }
-      final basePrefix = _cosBasePrefix(baseUrl);
-      for (final name in const ['update.md', 'note.md', 'readme.md']) {
-        final body = await _getCosText(
-          baseUrl,
-          '$basePrefix$kCosNoteFolder/$name',
-        );
-        if (body != null && body.isNotEmpty) return body;
-      }
+      final raw = await _getCosText(baseUrl, mdKeys.last, auth: auth);
+      return raw == null || raw.isEmpty ? null : normalizeCosNote(raw);
+    } on HttpException {
+      // List 失败时再试一次带鉴权的固定名探测已做过；直接视为无通知
       return null;
     }
   }

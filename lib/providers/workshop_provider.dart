@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
@@ -12,7 +13,8 @@ class WorkshopProvider extends ChangeNotifier {
   static const _storageKey = 'workshop_repositories_v1';
   static const _notifyEnabledKey = 'workshop_notify_enabled_v1';
   static const _notifyRepoIdKey = 'workshop_notify_repo_id_v1';
-  static const _lastNotifyBodyKey = 'workshop_last_notify_body_v1';
+  static const _lastNotifyBodyKey = 'workshop_last_notify_body_v1'; // 旧版兼容
+  static const _notifyHashKey = 'workshop_last_notify_hash_v2';
 
   List<WorkshopRepository> _repositories = [];
   // 仓库 id -> tag -> 资产列表（内存缓存，避免重复请求）
@@ -22,7 +24,7 @@ class WorkshopProvider extends ChangeNotifier {
   final Map<String, ({String body, DateTime at})> _cosNoteState = {};
 
   /// Note 变更探测间隔：窗口内再次进分类不再拉 Note
-  static const Duration _cosNoteCheckTtl = Duration(minutes: 5);
+  static const Duration _cosNoteCheckTtl = Duration(minutes: 30);
 
   /// 更新通知是否启用
   bool _notifyEnabled = false;
@@ -30,8 +32,12 @@ class WorkshopProvider extends ChangeNotifier {
   /// 用于接收通知的仓库 id
   String? _notifyRepoId;
 
-  /// 上一次获取的通知内容（用于去重）
-  String? _lastNotifyBody;
+  /// 各仓库上次已提醒过的通知内容指纹（sha1）。
+  /// 内容不变则不再弹窗；换仓库也不会互相干扰。
+  final Map<String, String> _lastNotifyHashes = {};
+
+  /// COS 仓库列表是否已拉全（false = 目前仅有首页）
+  final Map<String, bool> _cosListComplete = {};
 
   List<WorkshopRepository> get repositories => List.unmodifiable(_repositories);
 
@@ -52,7 +58,25 @@ class WorkshopProvider extends ChangeNotifier {
     }
     _notifyEnabled = prefs.getBool(_notifyEnabledKey) ?? false;
     _notifyRepoId = prefs.getString(_notifyRepoIdKey);
-    _lastNotifyBody = prefs.getString(_lastNotifyBodyKey);
+    _lastNotifyHashes.clear();
+    final rawHashes = prefs.getString(_notifyHashKey);
+    if (rawHashes != null && rawHashes.isNotEmpty) {
+      try {
+        final map = jsonDecode(rawHashes) as Map<String, dynamic>;
+        for (final e in map.entries) {
+          if (e.value is String) _lastNotifyHashes[e.key] = e.value as String;
+        }
+      } catch (_) {}
+    }
+    // 旧版仅存一份全文：迁移到当前通知仓库指纹，避免升级后重复弹一次
+    final legacyBody = prefs.getString(_lastNotifyBodyKey);
+    if (legacyBody != null &&
+        legacyBody.isNotEmpty &&
+        _notifyRepoId != null &&
+        !_lastNotifyHashes.containsKey(_notifyRepoId)) {
+      _lastNotifyHashes[_notifyRepoId!] =
+          _noteFingerprint(WorkshopService.normalizeCosNote(legacyBody));
+    }
 
     // 检查是否需要自动设置通知仓库（APP 更新后）
     await _autoSetupNotifyRepoIfNeeded(prefs);
@@ -214,6 +238,7 @@ class WorkshopProvider extends ChangeNotifier {
       // 清空该仓库的资产缓存，重新拉取
       _assetsCache.remove(repo.id);
       _cosNoteState.remove(repo.id);
+      _cosListComplete.remove(repo.id);
       if (repo.isCos) WorkshopService.invalidateCosListCache(repo.url);
     } catch (e) {
       _repositories[index] = repo.copyWith(error: '$e');
@@ -318,22 +343,33 @@ class WorkshopProvider extends ChangeNotifier {
       _cosNoteState[repo.id] = (body: '', at: now);
       return;
     }
+    note = WorkshopService.normalizeCosNote(note);
     // 与本地已存 Note 不一致 → 强制刷新
     if (state != null && state.body.isNotEmpty && note != state.body) {
       WorkshopService.invalidateCosListCache(repo.url);
       _assetsCache.remove(repo.id);
+      _cosListComplete.remove(repo.id);
     }
     _cosNoteState[repo.id] = (body: note, at: now);
   }
 
-  /// 拉取仓库某 tag 下的 zip 资产（带内存缓存）
+  /// 该 COS 仓库当前资产列表是否已取全（false 时可「加载更多」）
+  bool cosListComplete(String repoId) => _cosListComplete[repoId] ?? true;
+
+  /// 拉取仓库某 tag 下的 zip 资产（带内存缓存）。
+  /// COS 默认只拉首页（约 500 条对象）；[loadAll] 为 true 时拉全量。
   Future<List<WorkshopAsset>> loadAssets(
     WorkshopRepository repo,
-    String tag,
-  ) async {
+    String tag, {
+    bool loadAll = false,
+  }) async {
     // COS：先做 Note 变更探测（变了才清缓存）
     if (repo.isCos) {
       await _syncCosIfNoteChanged(repo);
+      if (loadAll) {
+        // 全量前清掉该 tag 的首页缓存，避免拿到截断列表
+        _assetsCache[repo.id]?.remove(tag);
+      }
     }
     final cached = _assetsCache[repo.id]?[tag];
     if (cached != null) return cached;
@@ -343,12 +379,18 @@ class WorkshopProvider extends ChangeNotifier {
         repo.url,
         tag,
         auth: repo.hasCosAuth ? repo.cosAuth : null,
+        loadAll: loadAll,
+      );
+      _cosListComplete[repo.id] = WorkshopService.cosListIsComplete(
+        repo.url,
+        auth: repo.hasCosAuth ? repo.cosAuth : null,
       );
     } else {
       final parsed = WorkshopService.parseRepoPath(repo.url);
       list = parsed == null
           ? const <WorkshopAsset>[]
           : await WorkshopService.listAssets(repo.url, tag);
+      _cosListComplete[repo.id] = true;
     }
     _assetsCache.putIfAbsent(repo.id, () => {})[tag] = list;
     return list;
@@ -430,19 +472,32 @@ class WorkshopProvider extends ChangeNotifier {
           kUpdateNotifyTag,
         );
       }
-      if (body == null) return null;
+      if (body == null || body.trim().isEmpty) return null;
 
-      // 与上次内容比较
-      if (body == _lastNotifyBody) return null;
+      final normalized = notifyRepo.isCos
+          ? WorkshopService.normalizeCosNote(body)
+          : body.trim();
+      final hash = _noteFingerprint(normalized);
+      final last = _lastNotifyHashes[notifyRepo.id];
 
-      // 内容有变化，保存并返回
-      _lastNotifyBody = body;
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_lastNotifyBodyKey, body);
-      return body;
+      // 与该仓库上次已提醒内容相同 → 不再提醒
+      if (last != null && last == hash) return null;
+
+      // 内容有变化（或首次记录），保存指纹后再弹窗
+      _lastNotifyHashes[notifyRepo.id] = hash;
+      await _persistNotifyHashes();
+      return normalized;
     } catch (_) {
       return null;
     }
+  }
+
+  static String _noteFingerprint(String body) =>
+      sha1.convert(utf8.encode(body)).toString();
+
+  Future<void> _persistNotifyHashes() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_notifyHashKey, jsonEncode(_lastNotifyHashes));
   }
 
   /// 获取通知仓库信息（用于 UI 显示）

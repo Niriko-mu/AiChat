@@ -81,9 +81,10 @@ A **roleplay-style WeChat chat app** built with Flutter for Android. Features mu
   - **Characters Category (V1.1.0)**: ZIP files containing character folders with `Profile.json`.
   - **Games Category (V1.0.0)**: Moments data packs containing `moments.json`.
   - **Stickers Category (V1.3.0)**: Sticker ZIP packs (GIF / WebP / PNG / JPG/JPEG); filenames become notes.
-  - **Update Notifications (V1.2.0)**: Receive repository update notifications (Git reads Release body; COS reads `Note/*.md`).
+  - **Update Notifications (V1.2.0)**: Git reads Release body; COS reads `Note/*.md` (notify only when content changes).
   - Support GitHub download proxy acceleration.
-  - Support COS-compatible object storage (Tencent COS / Aliyun OSS / AWS S3 / MinIO, anonymous List/Get required).
+  - COS-compatible object storage: public read, or **private read with access keys** (stored on device only).
+  - Lazy listing: first page (~500 objects) on open; search or "Load more" fetches the rest; list cache ~30 minutes.
 - **Moments Data Pack**: **Me → Manage Moments** to import/export character Moments data packs with selective export.
 
 ### Memory System
@@ -113,9 +114,11 @@ A **roleplay-style WeChat chat app** built with Flutter for Android. Features mu
 
 - **Context Management**: Set context message count (1–999 or "Unlimited"), with precise input.
 - **Auto Session Compression**: When context is set to "Unlimited," compression is automatically enabled when the model's context threshold (adjustable) is reached.
+- **Model Thinking Intensity**: Chat settings — Off / Low / Default / High / XHigh (maps to `reasoning_effort` / `enable_thinking`; depends on model support).
+- **AI Thinking Content**: Store model reasoning without sending it back; long-press an AI message to view it; optional thinking duration under the bubble.
 - **Provider Presets**: Built-in presets for multiple AI providers (OpenAI, Google Gemini, Xiaomi MiMo, etc.).
 - **Model Detection**: One-click detection of available model lists.
-- **Token Usage Statistics**: Track cumulative token usage across conversations.
+- **Token Usage Statistics**: Cumulative input / output / **thinking** tokens (output already includes thinking, aligned with billing).
 
 ### UI & Personalization
 
@@ -129,12 +132,13 @@ A **roleplay-style WeChat chat app** built with Flutter for Android. Features mu
 
 ### Other Features
 
-- **Auto-Update**: Auto-detect new versions on startup (Gitee primary, GitHub backup). One-click APK download and install.
-- **Chat History Export/Import**: Export chat history as a zip package (including text, images, files).
+- **Auto-Update**: Auto-detect new versions on startup (Gitee primary, GitHub backup). Gitee/GitHub check repositories are separately configurable. One-click APK download and install.
+- **Chat History Export/Import**: Export chat as zip (text/images/files); optional inclusion of AI thinking content.
 - **Storage Management**: Manage app storage (user data / app cache), with cleanup support.
 - **Developer Log**: View real-time logs in developer mode.
 - **System Notification**: Push notifications when characters send messages while you're outside the chat.
 - **Image Crop**: Crop images before sending.
+- **Contacts A–Z Index**: Side letter index with long-press slide to jump.
 
 ### Data Ownership
 
@@ -515,7 +519,9 @@ When using COS / OSS / S3-compatible object storage, the app auto-discovers asse
 
 **Note priority**: `update.md` → `note.md` → `readme.md` → last `.md` in the folder.
 
-**Listing**: S3 ListObjects V2 (`GET {bucket-root}/?list-type=2&prefix={base-path}/&max-keys=1000`). Pagination is not implemented yet; up to 1000 objects per request.
+**Listing**: S3 ListObjects V2. Opening a category fetches the first page (~500 objects); search or "Load more" follows `continuation-token` to load the rest (default up to ~10 pages). List results are cached for about 30 minutes.
+
+**Change refresh**: Entering a category probes `Note/*.md`; a full re-list is forced only when Note content changes. Manual refresh is also available in repository management.
 
 **Permissions**: by default the bucket must allow anonymous **ListObjects** (GET Bucket) and **GetObject** (GET Object). Alternatively, enable "Use access keys (private read)" when adding a COS repository to sign requests with AccessKey (Tencent COS / Aliyun OSS supported); the bucket can stay private. Keys are stored only on device. Without list permission and without keys, the app cannot enumerate zips and shows HTTP 403.
 
@@ -711,7 +717,7 @@ curl -I "https://your-bucket-domain/Note/update.md"
 
 - Put only publicly shareable packs / notes in this bucket — never keys or private data
 - Prefer a narrow BASE_URL prefix if the whole bucket need not be listed
-- Paid/private content needs real auth: current implementation is anonymous List + Get only
+- Paid/private content: enable access-key private read (Tencent COS / Aliyun OSS) instead of relying on anonymous List + Get
 
 ---
 
@@ -801,8 +807,9 @@ Track cumulative token usage across conversations (private chats, group chats, M
 
 ### Statistics Content
 
-- **Input Tokens**: Cumulative tokens sent to the model (API usage.prompt_tokens accumulated).
-- **Output Tokens**: Cumulative tokens received from the model (API usage.completion_tokens accumulated).
+- **Input Tokens**: Cumulative tokens sent to the model (API `prompt_tokens`).
+- **Output Tokens**: Cumulative tokens from the model (API `completion_tokens`, **includes thinking**, aligned with billing).
+- **Thinking Tokens**: Thinking portion of output; prefer API `completion_tokens_details.reasoning_tokens`, else estimate from reasoning text. **Not double-counted** in the total.
 - **Total Tokens**: Input + Output.
 
 ### Data Sources
@@ -813,7 +820,7 @@ Track cumulative token usage across conversations (private chats, group chats, M
 
 ### Actions
 
-- **View**: Display token usage by conversation category.
+- **View**: Display token usage by conversation category; tiles show thinking when present.
 - **Reset**: One-click reset of all token usage statistics.
 
 ---
@@ -1114,8 +1121,9 @@ flutter build apk --release --split-per-abi
 ## Auto-Update Mechanism
 
 - **Version Check (Dual-Source)**:
-  1. Gitee first: `https://gitee.com/api/v5/repos/Murchey/AiChatApp/releases/latest` (direct in China);
-  2. GitHub backup: `https://api.github.com/repos/Murchey/AiChatApp/releases/latest` (supports acceleration proxy).
+  1. Gitee first: default `https://gitee.com/Murchey/AiChatApp` (direct in China);
+  2. GitHub backup: default `https://github.com/Niriko-mu/AiChat` (supports acceleration proxy).
+  Check repositories can be customized separately under **Settings → Updates → Gitee / GitHub update repository** (full URL or `owner/repo`, persisted). Download URLs follow the configured repositories.
   Compares `tag_name` with local version; Gitee is prioritized for version and update notes.
 - **Download Source Tabs**: The update dialog provides "Download Source" tabs. **Gitee is preferred**, then GitHub. GitHub source supports acceleration proxy download.
 - **APK Asset Naming Standard**: `AiChat-V1.0.0.apk` (`AiChat-V<version>.apk`). During detection, assets matching the standard are preferred. When no assets are found, download URLs are constructed using this naming convention.
@@ -1123,6 +1131,7 @@ flutter build apk --release --split-per-abi
 - Access Points:
   - **Me → App Version**: Manually check for updates.
   - **Me → Settings → Auto-check for updates on startup**: Enable to auto-check each launch.
+  - **Me → Settings → Gitee / GitHub update repository**: Configure each check/download repository.
   - **Me → Settings → GitHub Acceleration URL**: Select/customize acceleration proxy (only affects GitHub downloads).
 
 Release new versions workflow: Create a Release in **both Gitee and GitHub repositories**. Fill `tag` with the same version as `pubspec.yaml` (`v` prefix optional; must be newer than local version). Upload the properly named APK asset `AiChat-V<version>.apk`.

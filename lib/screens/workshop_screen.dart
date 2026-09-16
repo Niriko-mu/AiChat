@@ -60,6 +60,12 @@ class _WorkshopScreenState extends State<WorkshopScreen> {
     kGamePackTag: false,
     kStickerPackTag: false,
   };
+  /// 分类是否还有更多（COS 首页截断时为 true）
+  final Map<String, bool> _hasMore = {
+    kCharacterPackTag: false,
+    kGamePackTag: false,
+    kStickerPackTag: false,
+  };
   final Set<String> _selected = {};
   bool _importing = false;
 
@@ -247,7 +253,7 @@ class _WorkshopScreenState extends State<WorkshopScreen> {
         subtitle: Text(
           loading
               ? '正在加载…'
-              : '$subtitle${_checked[tag] == true ? ' · $itemCount 个资产' : ''}',
+              : '$subtitle${_checked[tag] == true ? ' · $itemCount 个资产${_hasMore[tag] == true ? '（还有更多）' : ''}' : ''}',
           style: TextStyle(fontSize: 12, color: context.textSecondaryColor),
         ),
         trailing: CupertinoSwitch(
@@ -264,21 +270,30 @@ class _WorkshopScreenState extends State<WorkshopScreen> {
     );
   }
 
-  /// 拉取所有已配置仓库中该 tag 下的 zip 资产
-  Future<void> _loadCategory(String tag) async {
+  /// 拉取所有已配置仓库中该 tag 下的 zip 资产。
+  /// COS 默认首页（约 500）；[loadAll] 或搜索时拉全量。
+  Future<void> _loadCategory(String tag, {bool loadAll = false}) async {
     setState(() => _loading[tag] = true);
     final provider = context.read<WorkshopProvider>();
     final items = <_ZipItem>[];
     String? error;
+    var hasMore = false;
     try {
       for (final repo in provider.repositories) {
         // availableTags 是仓库添加/上次刷新时持久化的检测快照。旧版本保存
         // 的仓库没有 V1.3.0 时不能用它阻断请求，否则远端新上传的表情包资产
         // 永远不会被拉取。loadAssets 自带内存缓存，直接请求即可兼容旧数据。
-        final assets = await provider.loadAssets(repo, tag);
+        final assets = await provider.loadAssets(
+          repo,
+          tag,
+          loadAll: loadAll,
+        );
         items.addAll(assets.map(
           (a) => _ZipItem(asset: a, repoName: repo.name, repoId: repo.id),
         ));
+        if (repo.isCos && !provider.cosListComplete(repo.id)) {
+          hasMore = true;
+        }
       }
     } catch (e) {
       error = '$e';
@@ -287,8 +302,19 @@ class _WorkshopScreenState extends State<WorkshopScreen> {
     setState(() {
       _items[tag] = items;
       _loading[tag] = false;
+      _hasMore[tag] = hasMore;
     });
     if (error != null) _showTip('拉取资产失败：$error');
+  }
+
+  /// 搜索时确保 COS 列表已拉全，避免只在首页里搜
+  Future<void> _ensureFullListForSearch() async {
+    for (final tag in kWorkshopPackTags) {
+      if (_checked[tag] == true && _hasMore[tag] == true) {
+        await _loadCategory(tag, loadAll: true);
+        if (!mounted) return;
+      }
+    }
   }
 
   /// 下载选中的 zip 并逐个导入（新机制：先批量下载，再逐个确认导入）
@@ -725,7 +751,14 @@ class _WorkshopScreenState extends State<WorkshopScreen> {
                   color: context.textSecondaryColor,
                 ),
               ),
-        onChanged: (v) => setState(() => _searchQuery = v),
+        onChanged: (v) {
+          final trimmed = v.trim();
+          setState(() => _searchQuery = v);
+          // 开始搜索时拉全 COS 列表，避免只搜到首页
+          if (trimmed.isNotEmpty) {
+            _ensureFullListForSearch();
+          }
+        },
       ),
     );
   }
@@ -831,8 +864,26 @@ class _WorkshopScreenState extends State<WorkshopScreen> {
               ),
             ),
           )
-        else
+        else ...[
           for (final item in items) _buildZipRow(context, item),
+          if (_hasMore[tag] == true)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+              child: SizedBox(
+                width: double.infinity,
+                child: CupertinoButton.filled(
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                  onPressed: loading
+                      ? null
+                      : () => _loadCategory(tag, loadAll: true),
+                  child: Text(
+                    '加载更多（当前 ${items.length} 个）',
+                    style: const TextStyle(fontSize: 14),
+                  ),
+                ),
+              ),
+            ),
+        ],
       ],
     );
   }
