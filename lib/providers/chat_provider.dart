@@ -192,6 +192,14 @@ class ChatProvider extends ChangeNotifier {
     return const [];
   }
 
+  /// 会话头像快照（统计页记忆用；会话不存在时返回空）
+  String _conversationAvatar(String conversationId) {
+    for (final c in _conversations) {
+      if (c.id == conversationId) return c.characterAvatar;
+    }
+    return '';
+  }
+
   /// 获取某角色最后一条消息的时间。
   /// 没有会话记录时返回 null。
   DateTime? getLastMessageTimeForCharacter(String characterId) {
@@ -565,6 +573,8 @@ class ChatProvider extends ChangeNotifier {
           totalTokens: promptTokens + completionTokens,
           reasoningTokens: reasoningTokens,
         ),
+        label: characterName,
+        avatar: _conversationAvatar(conversationId),
       );
       // 进度条显示下一次请求可能携带的上下文，必须与 contextCount 和
       // _buildHistory 的消息转换规则保持一致。
@@ -823,7 +833,12 @@ class ChatProvider extends ChangeNotifier {
               LLMService.estimateReasoningTokens(result.reasoningContent),
         );
       }
-      await TokenUsageProvider.instance.addUsage(conversationId, usage);
+      await TokenUsageProvider.instance.addUsage(
+        conversationId,
+        usage,
+        label: characterName,
+        avatar: _conversationAvatar(conversationId),
+      );
       final random = Random();
       final displayedMessages = <String>[];
       var stickerSent = false;

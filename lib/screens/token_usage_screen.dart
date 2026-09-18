@@ -203,14 +203,18 @@ class _TokenUsageScreenState extends State<TokenUsageScreen> {
     final character = conversation != null
         ? characterProvider.getCharacterById(conversation.characterId)
         : null;
-    final title =
-        character?.displayName ?? conversation?.characterName ?? '已删除的会话';
-    final avatar = conversation?.characterAvatar ?? '';
+    // 会话还在时优先实时名称；会话删除后用统计页记住的名称，不再显示占位
+    final remembered = e.value.label.trim();
+    final title = character?.displayName ??
+        conversation?.characterName ??
+        (remembered.isNotEmpty ? remembered : '未命名会话');
+    final avatar =
+        conversation?.characterAvatar ?? e.value.avatar;
+    final showAvatar = avatar.isNotEmpty;
     return _UsageTile(
       title: title,
-      avatar: avatar,
+      avatar: showAvatar ? avatar : '',
       usage: e.value,
-      subtitle: conversation == null ? '会话已删除' : null,
     );
   }
 
@@ -220,13 +224,14 @@ class _TokenUsageScreenState extends State<TokenUsageScreen> {
     GroupChatProvider groupProvider,
   ) {
     final group = _firstById(groupProvider.groups, e.key, (g) => g.id);
-    final title =
-        group == null ? '已删除的群聊' : '${group.name}（${group.memberCount}）';
+    final remembered = e.value.label.trim();
+    final title = group != null
+        ? '${group.name}（${group.memberCount}）'
+        : (remembered.isNotEmpty ? remembered : '未命名群聊');
     return _UsageTile(
       title: title,
-      avatar: group?.avatar ?? '',
+      avatar: group?.avatar ?? e.value.avatar,
       usage: e.value,
-      subtitle: group == null ? '群聊已删除' : null,
     );
   }
 
@@ -322,7 +327,6 @@ class _UsageTile extends StatelessWidget {
   final String title;
   final String? avatar;
   final TokenUsage usage;
-  final String? subtitle;
 
   /// 无头像场景（如朋友圈聚合）用图标占位
   final IconData? leadingIcon;
@@ -331,19 +335,17 @@ class _UsageTile extends StatelessWidget {
     required this.title,
     this.avatar,
     required this.usage,
-    this.subtitle,
     this.leadingIcon,
   });
 
   @override
   Widget build(BuildContext context) {
-    final sub = subtitle ??
-        (usage.reasoningTokens > 0
-            ? '输入 ${_fmtTokens(usage.sentTokens)} · '
-                '输出 ${_fmtTokens(usage.receivedTokens)}'
-                '（思考 ${_fmtTokens(usage.reasoningTokens)}）'
-            : '输入 ${_fmtTokens(usage.sentTokens)} · '
-                '输出 ${_fmtTokens(usage.receivedTokens)}');
+    final sub = usage.reasoningTokens > 0
+        ? '输入 ${_fmtTokens(usage.sentTokens)} · '
+            '输出 ${_fmtTokens(usage.receivedTokens)}'
+            '（思考 ${_fmtTokens(usage.reasoningTokens)}）'
+        : '输入 ${_fmtTokens(usage.sentTokens)} · '
+            '输出 ${_fmtTokens(usage.receivedTokens)}';
     return CupertinoListTile(
       leading: leadingIcon != null
           ? Container(

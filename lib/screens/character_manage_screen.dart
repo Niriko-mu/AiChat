@@ -107,34 +107,82 @@ class _CharacterManageScreenState extends State<CharacterManageScreen> {
     const uuid = Uuid();
     var count = 0;
 
-    for (final entry in entries) {
-      if (entry.error != null) continue;
+    final usable = entries
+        .where((e) => e.error == null && e.character.name.trim().isNotEmpty)
+        .toList();
+    final conflicts = usable
+        .where((e) =>
+            provider.findCharacterByName(e.character.name.trim()) != null)
+        .map((e) => e.character.name.trim())
+        .toList();
+
+    // 批量：多个同名时一次确认，避免游戏包里逐个点覆盖
+    var overwriteAll = false;
+    var skipDuplicates = false;
+    if (conflicts.isNotEmpty) {
+      final choice = await showCupertinoDialog<String>(
+        context: context,
+        builder: (ctx) => CupertinoAlertDialog(
+          title: const Text('已有同名角色'),
+          content: Text(
+            '有 ${conflicts.length} 个角色与本地重名：\n'
+            '${conflicts.length <= 6 ? conflicts.join('、') : '${conflicts.take(6).join('、')} 等'}\n\n'
+            '覆盖会替换资料与提示词，聊天记录保留。',
+            textAlign: TextAlign.left,
+            style: const TextStyle(fontSize: 13, height: 1.45),
+          ),
+          actions: [
+            CupertinoDialogAction(
+              isDestructiveAction: true,
+              onPressed: () => Navigator.pop(ctx, 'cancel'),
+              child: const Text('取消'),
+            ),
+            CupertinoDialogAction(
+              onPressed: () => Navigator.pop(ctx, 'skip'),
+              child: const Text('仅导入新角色'),
+            ),
+            CupertinoDialogAction(
+              isDefaultAction: true,
+              onPressed: () => Navigator.pop(ctx, 'all'),
+              child: const Text('全部覆盖'),
+            ),
+          ],
+        ),
+      );
+      if (choice == null || choice == 'cancel' || !mounted) return;
+      overwriteAll = choice == 'all';
+      skipDuplicates = choice == 'skip';
+    }
+
+    for (final entry in usable) {
       final name = entry.character.name.trim();
-      if (name.isEmpty) continue;
 
       // 检查是否重名
       final existing = provider.findCharacterByName(name);
       if (existing != null) {
-        // 重名：弹窗确认覆盖
-        final overwrite = await showCupertinoDialog<bool>(
-          context: context,
-          builder: (ctx) => CupertinoAlertDialog(
-            title: const Text('角色已存在'),
-            content: Text('已存在名为「$name」的角色，是否覆盖？'),
-            actions: [
-              CupertinoDialogAction(
-                child: const Text('跳过'),
-                onPressed: () => Navigator.pop(ctx, false),
-              ),
-              CupertinoDialogAction(
-                isDefaultAction: true,
-                child: const Text('覆盖'),
-                onPressed: () => Navigator.pop(ctx, true),
-              ),
-            ],
-          ),
-        );
-        if (overwrite != true || !mounted) continue;
+        if (skipDuplicates) continue;
+        if (!overwriteAll) {
+          // 仅剩单个冲突等场景：仍可逐个确认
+          final overwrite = await showCupertinoDialog<bool>(
+            context: context,
+            builder: (ctx) => CupertinoAlertDialog(
+              title: const Text('角色已存在'),
+              content: Text('已存在名为「$name」的角色，是否覆盖？'),
+              actions: [
+                CupertinoDialogAction(
+                  child: const Text('跳过'),
+                  onPressed: () => Navigator.pop(ctx, false),
+                ),
+                CupertinoDialogAction(
+                  isDefaultAction: true,
+                  child: const Text('覆盖'),
+                  onPressed: () => Navigator.pop(ctx, true),
+                ),
+              ],
+            ),
+          );
+          if (overwrite != true || !mounted) continue;
+        }
 
         // 覆盖：保留原 id，替换资料
         final json = entry.character.toJson()

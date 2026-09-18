@@ -639,7 +639,13 @@ class GroupChatProvider extends ChangeNotifier {
         );
         if (generation != _replyGeneration) break;
         // 累计该群真实 token 用量（发送 = prompt_tokens，接收 = completion_tokens）
-        TokenUsageProvider.instance.addUsage(groupId, result.usage);
+        final g = getGroupById(groupId);
+        TokenUsageProvider.instance.addUsage(
+          groupId,
+          result.usage,
+          label: g?.name,
+          avatar: g?.avatar,
+        );
 
         var visibleMessageIndex = 0;
         var stickerSent = false;

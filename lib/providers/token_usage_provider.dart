@@ -72,8 +72,14 @@ class TokenUsageProvider extends ChangeNotifier {
   }
 
   /// 记录一次真实 token 用量（API 未返回 usage 时忽略）。
+  /// [label]/[avatar] 会写入统计条目，会话删除后统计页仍可显示原名称。
   /// 返回累计后的该会话用量（供调用方决定是否展示）。
-  Future<TokenUsage> addUsage(String conversationId, ChatUsage usage) {
+  Future<TokenUsage> addUsage(
+    String conversationId,
+    ChatUsage usage, {
+    String? label,
+    String? avatar,
+  }) {
     if (usage.isEmpty) return Future.value(usageFor(conversationId));
     final task = _mutationQueue.then((_) async {
       await init();
@@ -82,6 +88,10 @@ class TokenUsageProvider extends ChangeNotifier {
         sentTokens: prev.sentTokens + (usage.promptTokens ?? 0),
         receivedTokens: prev.receivedTokens + (usage.completionTokens ?? 0),
         reasoningTokens: prev.reasoningTokens + (usage.reasoningTokens ?? 0),
+        label: (label != null && label.trim().isNotEmpty)
+            ? label.trim()
+            : prev.label,
+        avatar: (avatar != null && avatar.isNotEmpty) ? avatar : prev.avatar,
       );
       _usages[conversationId] = next;
       if (_usages.length > _maxEntries) {

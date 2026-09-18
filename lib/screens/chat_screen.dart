@@ -1711,6 +1711,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         await TokenUsageProvider.instance.addUsage(
           widget.conversationId,
           choiceResult.usage,
+          label: widget.characterName,
         );
         if (mounted) {
           await chatProvider.setRoleplayChoices(
