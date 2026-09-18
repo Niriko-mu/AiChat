@@ -4,7 +4,9 @@ import 'package:uuid/uuid.dart';
 import '../config/motion.dart';
 import '../config/theme.dart';
 import '../models/character.dart';
+import '../models/character_pack_entry.dart';
 import '../models/moments_pack_entry.dart';
+import '../models/sticker_pack.dart';
 import '../models/workshop_asset.dart';
 import '../models/workshop_repository.dart';
 import '../providers/character_provider.dart';
@@ -317,7 +319,9 @@ class _WorkshopScreenState extends State<WorkshopScreen> {
     }
   }
 
-  /// 下载选中的 zip 并逐个导入（新机制：先批量下载，再逐个确认导入）
+  /// 下载选中的 zip 并导入：
+  /// 先批量下载，再按类型合并解析——多个角色包 zip 合并为一次勾选导入
+  /// （同名覆盖只询问一次），多个朋友圈包合并为一次确认。
   Future<void> _downloadAndImport() async {
     if (_importing) return;
     final selected = _allItems.where((i) => _selected.contains(i.key)).toList();
@@ -341,34 +345,130 @@ class _WorkshopScreenState extends State<WorkshopScreen> {
         return;
       }
 
-      // ── 阶段二：逐个让用户确认导入 ──
-      var importCount = 0;
+      // ── 阶段二：解析并按类型合并，同类只确认/询问一次 ──
+      final charEntries = <CharacterPackEntry>[];
+      final momentsEntries = <MomentsPackEntry>[];
+      final stickerPacks = <StickerPack>[];
+      var charZipCount = 0;
+      var momentsZipCount = 0;
+      var stickerZipCount = 0;
       var failCount = 0;
+      final usedFolderNames = <String>{};
+
       for (final item in selected) {
         if (!mounted) return;
         final path = downloadResults[item.key];
         if (path == null) {
-          // 该 zip 下载失败，跳过
           failCount++;
           continue;
         }
-        // 不依赖 tag，自动检测 zip 内容类型
-        final success = await _importZip(path, item);
-        if (success) importCount++;
-        // 导入完成：清理该 zip 的下载缓存（含 .part 临时文件）
-        WorkshopService.removeDownloadCache(path);
+
+        var handled = false;
+        // 角色包
+        try {
+          final entries = await CharacterPackService.parsePack(path);
+          if (entries.isNotEmpty) {
+            charZipCount++;
+            for (final e in entries) {
+              var folder = e.folderName;
+              if (!usedFolderNames.add(folder)) {
+                // 跨 zip 文件夹名冲突时加序号，保证勾选 key 唯一
+                var n = 2;
+                while (!usedFolderNames.add('${e.folderName}#$n')) {
+                  n++;
+                }
+                folder = '${e.folderName}#$n';
+              }
+              charEntries.add(CharacterPackEntry(
+                folderName: folder,
+                character: e.character,
+                memoryPoints: e.memoryPoints,
+                error: e.error,
+              ));
+            }
+            handled = true;
+          }
+        } catch (_) {}
+
+        // 朋友圈包
+        if (!handled) {
+          try {
+            final m = await CharacterPackService.parseMomentsPack(path);
+            if (m.isNotEmpty) {
+              momentsZipCount++;
+              momentsEntries.addAll(m);
+              handled = true;
+            }
+          } catch (_) {}
+        }
+
+        // 表情包
+        if (!handled) {
+          try {
+            final pack = await StickerPackService.parseStickerPackZip(
+              path,
+              name: item.asset.displayName,
+              author: item.repoName,
+            );
+            if (pack != null) {
+              stickerZipCount++;
+              stickerPacks.add(pack);
+              handled = true;
+            }
+          } catch (_) {}
+        }
+
+        if (handled) {
+          WorkshopService.removeDownloadCache(path);
+        } else {
+          failCount++;
+          WorkshopService.removeDownloadCache(path);
+          if (mounted) {
+            _showTip(
+              '「${item.asset.displayName}」无法识别：zip 中未找到角色数据、朋友圈数据或表情包图片',
+            );
+          }
+        }
       }
 
-      // 显示导入结果摘要
+      var importCount = 0;
+
+      // 角色包：全部条目合并成一页，同名批量覆盖只问一次
+      if (charEntries.isNotEmpty && mounted) {
+        await Navigator.push(
+          context,
+          CupertinoPageRoute(
+            builder: (_) => CharacterImportScreen(
+              entries: charEntries,
+              zipName: charZipCount > 1
+                  ? '创意工坊（$charZipCount 个角色包）'
+                  : '创意工坊角色包',
+            ),
+          ),
+        );
+        importCount += charZipCount;
+      }
+
+      // 朋友圈包：合并后一次确认
+      if (momentsEntries.isNotEmpty && mounted) {
+        await _confirmImportMoments(momentsEntries);
+        importCount += momentsZipCount;
+      }
+
+      // 表情包：多个时合并确认一次
+      if (stickerPacks.isNotEmpty && mounted) {
+        final ok = await _confirmImportStickers(stickerPacks);
+        if (ok) importCount += stickerZipCount;
+      }
+
       if (!mounted) return;
       final total = selected.length;
-      final downloadFailCount = total - downloadResults.length;
       final msg = StringBuffer('批量导入完成：');
       msg.write('共 $total 个 zip，');
-      if (downloadFailCount > 0) msg.write('$downloadFailCount 个下载失败，');
-      msg.write('成功导入 $importCount 个');
-      if (failCount > importCount) {
-        msg.write('，${failCount - downloadFailCount} 个导入失败');
+      if (failCount > 0) msg.write('$failCount 个失败，');
+      msg.write('成功处理 $importCount 个');
+      if (charEntries.isNotEmpty) {
+        msg.write('（角色 ${charEntries.length} 个）');
       }
       await _showTip(msg.toString());
     } finally {
@@ -376,88 +476,36 @@ class _WorkshopScreenState extends State<WorkshopScreen> {
     }
   }
 
-  /// 自动检测 zip 内容类型并导入：
-  /// 1. 先尝试 parsePack（找 Profile.json → 角色包）
-  /// 2. 再尝试 parseMomentsPack（找 moments.json → 朋友圈数据包）
-  /// 3. 都失败则提示错误
-  Future<bool> _importZip(String path, _ZipItem item) async {
-    try {
-      // 优先尝试角色包解析
-      final entries = await CharacterPackService.parsePack(path);
-      if (!mounted) return false;
-      if (entries.isNotEmpty) {
-        // 找到角色数据，走角色导入流程
-        await Navigator.push(
-          context,
-          CupertinoPageRoute(
-            builder: (_) => CharacterImportScreen(
-              entries: entries,
-              zipName: item.asset.displayName,
-            ),
+  /// 表情包批量确认（1 个或多个共用一次弹窗）
+  Future<bool> _confirmImportStickers(List<StickerPack> packs) async {
+    if (packs.isEmpty) return false;
+    final desc = packs.length == 1
+        ? '将导入表情包「${packs.first.name}」（${packs.first.imagePaths.length} 张）'
+        : '将导入 ${packs.length} 个表情包，可在「设置 → 管理表情包」中管理。';
+    final confirmed = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (ctx) => CupertinoAlertDialog(
+        title: const Text('导入表情包'),
+        content: Text(desc, textAlign: TextAlign.center),
+        actions: [
+          CupertinoDialogAction(
+            child: const Text('取消'),
+            onPressed: () => Navigator.pop(ctx, false),
           ),
-        );
-        return true;
-      }
-    } catch (_) {
-      // parsePack 失败，继续尝试朋友圈数据包
-    }
-
-    try {
-      // 尝试朋友圈数据包解析
-      final momentsEntries = await CharacterPackService.parseMomentsPack(path);
-      if (!mounted) return false;
-      if (momentsEntries.isNotEmpty) {
-        await _confirmImportMoments(momentsEntries);
-        return true;
-      }
-    } catch (_) {
-      // parseMomentsPack 也失败
-    }
-
-    try {
-      // 尝试表情包解析（ZIP 内图片文件名即表情包备注，支持 gif/webp/png/jpg/jpeg）
-      final pack = await StickerPackService.parseStickerPackZip(
-        path,
-        name: item.asset.displayName,
-        author: item.repoName,
-      );
-      if (!mounted) return false;
-      if (pack != null) {
-        final confirmed = await showCupertinoDialog<bool>(
-          context: context,
-          builder: (ctx) => CupertinoAlertDialog(
-            title: const Text('导入表情包'),
-            content: Text(
-              '将导入表情包「${pack.name}」（${pack.imagePaths.length} 张），'
-              '可在「设置 → 管理表情包」中管理或删除。',
-              textAlign: TextAlign.center,
-            ),
-            actions: [
-              CupertinoDialogAction(
-                child: const Text('取消'),
-                onPressed: () => Navigator.pop(ctx, false),
-              ),
-              CupertinoDialogAction(
-                isDefaultAction: true,
-                onPressed: () => Navigator.pop(ctx, true),
-                child: const Text('确定'),
-              ),
-            ],
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('确定'),
           ),
-        );
-        if (confirmed == true && mounted) {
-          await context.read<StickerProvider>().importStickerPack(pack);
-        }
-        return true;
-      }
-    } catch (_) {
-      // 表情包解析失败，继续走类型错误提示
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return false;
+    final stickerProvider = context.read<StickerProvider>();
+    for (final pack in packs) {
+      await stickerProvider.importStickerPack(pack);
     }
-
-    if (mounted) {
-      _showTip('「${item.asset.displayName}」导入失败：zip 中未找到角色数据、朋友圈数据或表情包图片');
-    }
-    return false;
+    return true;
   }
 
   /// 确认导入朋友圈：匹配已有角色则更新其朋友圈，未匹配则新建角色

@@ -9,6 +9,7 @@ import '../providers/memory_point_provider.dart';
 import '../services/character_pack_service.dart';
 import '../utils/character_pack_picker.dart';
 import '../utils/conversation_relink.dart';
+import '../utils/file_picker_helper.dart';
 import '../widgets/character_avatar.dart';
 import 'chat_detail_screen.dart';
 import 'character_import_screen.dart';
@@ -220,7 +221,7 @@ class _CharacterManageScreenState extends State<CharacterManageScreen> {
     _showTip(count > 0 ? '成功导入 $count 个角色' : '未导入任何角色');
   }
 
-  /// 导出选中的角色为 zip 角色包
+  /// 导出选中的角色为 zip 角色包（系统保存对话框选择位置）
   Future<void> _exportSelected() async {
     final list = _selectedCharacters;
     if (list.isEmpty || _busy) return;
@@ -231,18 +232,23 @@ class _CharacterManageScreenState extends State<CharacterManageScreen> {
       final memoryByCharacter = {
         for (final c in list) c.id: memoryProvider.pointsFor(c.id),
       };
-      final path = await CharacterPackService.exportPack(
+      final packed = await CharacterPackService.encodeCharacterPack(
         list,
         memoryByCharacter: memoryByCharacter,
       );
       if (!mounted) return;
+      final savedName = await FilePickerHelper.saveFile(
+        suggestedName: packed.fileName,
+        mimeType: 'application/zip',
+        bytes: packed.bytes,
+      );
+      if (!mounted) return;
+      if (savedName == null) return; // 用户取消保存
       showCupertinoDialog(
         context: context,
         builder: (ctx) => CupertinoAlertDialog(
           title: const Text('导出成功'),
-          content: Text(
-            '已将 ${list.length} 个角色打包为 zip，可分享给他人：\n\n$path',
-          ),
+          content: Text('已将 ${list.length} 个角色打包并保存为：\n\n$savedName'),
           actions: [
             CupertinoDialogAction(
               isDefaultAction: true,

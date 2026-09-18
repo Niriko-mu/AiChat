@@ -142,20 +142,27 @@ class _MomentsManageScreenState extends State<MomentsManageScreen> {
     );
   }
 
-  /// 导出选中的角色为 zip 朋友圈数据包
+  /// 导出选中的角色为 zip 朋友圈数据包（系统保存对话框选择位置）
   Future<void> _exportSelected() async {
     final list = _selectedCharacters;
     if (list.isEmpty || _busy) return;
     setState(() => _busy = true);
     try {
-      final path = await CharacterPackService.exportMomentsPack(list);
+      final packed = await CharacterPackService.encodeMomentsPack(list);
       if (!mounted) return;
+      final savedName = await FilePickerHelper.saveFile(
+        suggestedName: packed.fileName,
+        mimeType: 'application/zip',
+        bytes: packed.bytes,
+      );
+      if (!mounted) return;
+      if (savedName == null) return; // 用户取消保存
       showCupertinoDialog(
         context: context,
         builder: (ctx) => CupertinoAlertDialog(
           title: const Text('导出成功'),
           content: Text(
-            '已将 ${list.length} 个角色的朋友圈打包为 zip，可分享给他人：\n\n$path',
+            '已将 ${list.length} 个角色的朋友圈打包并保存为：\n\n$savedName',
           ),
           actions: [
             CupertinoDialogAction(
